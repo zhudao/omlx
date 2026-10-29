@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -71,6 +71,7 @@ class ContentPart(BaseModel):
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
     video_url: Optional[ImageURL] = None
+    input_video: Optional[Union[ImageURL, str]] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 
@@ -324,6 +325,11 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+def _check_ngram_window(size: int | None, window: int | None) -> None:
+    if size and window and window < size:
+        raise ValueError("ngram_window must be 0 or at least no_repeat_ngram_size")
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -334,12 +340,17 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
+    no_repeat_ngram_size: int | None = Field(default=None, ge=0)
+    ngram_window: int | None = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
+        gt=0,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
     )
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None
@@ -366,6 +377,9 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
+    # System-wide GPU power cap in watts while this request runs. The lower of
+    # this and the model setting applies.
+    gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
@@ -374,6 +388,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Per-token log probabilities of the generated tokens
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -382,6 +399,17 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def check_ngram_window(self) -> "ChatCompletionRequest":
+        _check_ngram_window(self.no_repeat_ngram_size, self.ngram_window)
+        return self
+
+    @model_validator(mode="after")
+    def check_top_logprobs(self) -> "ChatCompletionRequest":
+        if self.top_logprobs and not self.logprobs:
+            raise ValueError("top_logprobs requires logprobs to be true")
+        return self
 
     @model_validator(mode="after")
     def normalize_top_level_enable_thinking(self) -> "ChatCompletionRequest":
@@ -409,11 +437,32 @@ class AssistantMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
 
 
+class TopLogprob(BaseModel):
+    """Log probability of one token."""
+
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChatCompletionTokenLogprob(TopLogprob):
+    """Log probability of a generated token and its most likely alternatives."""
+
+    top_logprobs: List[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """Log probabilities of the tokens in a choice."""
+
+    content: Optional[List[ChatCompletionTokenLogprob]] = None
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
 
     index: int = 0
     message: AssistantMessage
+    logprobs: Optional[ChoiceLogprobs] = None
     finish_reason: Optional[str] = "stop"
 
 
@@ -424,6 +473,12 @@ class PromptTokensDetails(BaseModel):
     audio_tokens: Optional[int] = None
 
 
+class CompletionTokensDetails(BaseModel):
+    """Breakdown of completion tokens used."""
+
+    reasoning_tokens: int = 0
+
+
 class Usage(BaseUsage):
     """Token usage statistics for OpenAI API.
 
@@ -432,6 +487,7 @@ class Usage(BaseUsage):
     """
 
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
@@ -473,9 +529,13 @@ class CompletionRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
-    max_tokens: Optional[int] = None
+    no_repeat_ngram_size: int | None = Field(default=None, ge=0)
+    ngram_window: int | None = Field(default=None, ge=0)
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None
@@ -486,6 +546,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
+    gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -494,6 +555,11 @@ class CompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def check_ngram_window(self) -> "CompletionRequest":
+        _check_ngram_window(self.no_repeat_ngram_size, self.ngram_window)
+        return self
 
 
 class CompletionChoice(BaseModel):
@@ -516,6 +582,76 @@ class CompletionResponse(BaseModel):
 
 
 # =============================================================================
+# Tokenization (vLLM-compatible /tokenize and /detokenize)
+# =============================================================================
+
+
+class TokenizeCompletionRequest(BaseModel):
+    """Tokenize a raw prompt the way /v1/completions does."""
+
+    model: str | None = None
+    prompt: str
+    add_special_tokens: bool = True
+    return_token_strs: bool = False
+
+
+class TokenizeChatRequest(BaseModel):
+    """Tokenize chat messages the way /v1/chat/completions renders them."""
+
+    model: str | None = None
+    messages: list[Message]
+    tools: list[ToolDefinition] | None = None
+    add_generation_prompt: bool = True
+    continue_final_message: bool = False
+    # None keeps the engine's own encoding, which differs between text and
+    # VLM engines. vLLM defaults to False.
+    add_special_tokens: bool | None = None
+    return_token_strs: bool = False
+    chat_template_kwargs: dict[str, Any] | None = None
+    # Accepted for vLLM schema compatibility; rejected when set.
+    chat_template: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_prompt(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and data.get("continue_final_message")
+            and data.get("add_generation_prompt")
+        ):
+            raise ValueError(
+                "Cannot set both `continue_final_message` and "
+                "`add_generation_prompt` to True."
+            )
+        return data
+
+
+TokenizeRequest = TokenizeChatRequest | TokenizeCompletionRequest
+
+
+class TokenizeResponse(BaseModel):
+    """Response for /tokenize."""
+
+    count: int
+    max_model_len: int | None = None
+    tokens: list[int]
+    token_strs: list[str] | None = None
+
+
+class DetokenizeRequest(BaseModel):
+    """Request for /detokenize."""
+
+    model: str | None = None
+    tokens: list[Annotated[int, Field(ge=0)]]
+
+
+class DetokenizeResponse(BaseModel):
+    """Response for /detokenize."""
+
+    prompt: str
+
+
+# =============================================================================
 # Models List
 # =============================================================================
 
@@ -531,6 +667,31 @@ class ModelInfo(BaseModel):
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
+    # Claude Desktop (Anthropic gateway mode) extensions. Only serialized on
+    # derived Claude tier alias entries (see ClaudeTierModelInfo below);
+    # excluded by default so the standard OpenAI listing is byte-identical
+    # to previous releases.
+    display_name: str | None = Field(default=None, exclude=True)
+    created_at: str | None = Field(default=None, exclude=True)
+    anthropic_family_tier: str | None = Field(default=None, exclude=True)
+    is_family_default: bool | None = Field(default=None, exclude=True)
+    max_tokens: int | None = Field(default=None, exclude=True)
+
+
+class ClaudeTierModelInfo(ModelInfo):
+    """ModelInfo for derived Claude Desktop tier aliases.
+
+    Re-includes the Anthropic gateway metadata fields that the base class
+    excludes, so only tier-alias entries carry ``display_name`` /
+    ``created_at`` / ``anthropic_family_tier`` / ``is_family_default`` /
+    ``max_tokens`` in /v1/models.
+    """
+
+    display_name: str | None = None
+    created_at: str | None = None
+    anthropic_family_tier: str | None = None
+    is_family_default: bool | None = None
+    max_tokens: int | None = None
 
 
 class ModelsResponse(BaseModel):
@@ -614,6 +775,7 @@ class ChatCompletionChunkChoice(BaseModel):
 
     index: int = 0
     delta: ChatCompletionChunkDelta
+    logprobs: Optional[ChoiceLogprobs] = None
     finish_reason: Optional[str] = None
 
 

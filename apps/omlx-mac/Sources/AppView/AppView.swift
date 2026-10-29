@@ -1,5 +1,5 @@
 // AppView shell. NavigationSplitView backed by the `AppSection` enum, one
-// sidebar row per screen, grouped into Server / Models / Benchmark / General
+// sidebar row per screen, grouped into Server / App / Models / Benchmark / General
 // sections. Sized close to the minimum comfortable settings window so the
 // first open does not feel oversized, while still surviving a resize.
 //
@@ -32,12 +32,20 @@ struct AppView: View {
             SettingsSidebar(selection: bindingForSelection())
                 .toolbar(removing: .sidebarToggle)
         } detail: {
-            ContentScaffold(section: section, detailTitle: detailTitle) {
+            ContentScaffold(
+                section: section,
+                detailTitle: detailTitle,
+                detailSubtitle: detailSubtitle,
+                ownsScrollView: section == .models && services.modelDetailID != nil
+            ) {
                 screen(for: section)
             }
         }
         .navigationSplitViewStyle(.balanced)
-        .frame(minWidth: 880, idealWidth: 880, minHeight: 600, idealHeight: 600)
+        // Fixed width, like System Settings: the sidebar plus the 720 pt
+        // content column. A wider window would only add empty margins.
+        .frame(width: 920)
+        .frame(minHeight: 600, idealHeight: 600)
         // The theme resolves this through the dynamic macOS window color so
         // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
@@ -55,6 +63,9 @@ struct AppView: View {
                 services.requestedSection = nil
             }
         }
+        .onChange(of: services.modelDetailID) { _, _ in
+            services.modelDetailPage = nil
+        }
         .onChange(of: services.updates.confirmationUpdate, initial: true) { _, update in
             presentedUpdate = update
         }
@@ -70,7 +81,9 @@ struct AppView: View {
                 },
                 onConfirm: {
                     services.updates.confirmUpdate(update)
-                    presentedUpdate = nil
+                    if services.updates.confirmationUpdate == nil {
+                        presentedUpdate = nil
+                    }
                 }
             )
                 .environment(\.omlxTheme, theme)
@@ -97,9 +110,15 @@ struct AppView: View {
 
     private var detailTitle: String? {
         if selectedSection == .models, let id = services.modelDetailID, !id.isEmpty {
-            return id
+            return services.modelDetailPage?.title ?? id
         }
         return nil
+    }
+
+    /// A model settings sub-page keeps the model id visible under its title.
+    private var detailSubtitle: String? {
+        guard selectedSection == .models, services.modelDetailPage != nil else { return nil }
+        return services.modelDetailID
     }
 
     @ViewBuilder
@@ -109,6 +128,7 @@ struct AppView: View {
         case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
+        case .askAI:        AskAIScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
         case .models:
@@ -176,12 +196,16 @@ private struct UpdateConfirmationSheet: View {
                 Text(String(localized: "update.confirm.title",
                             defaultValue: "oMLX \(update.version) is available",
                             comment: "Update confirmation sheet title; placeholder is the version"))
-                    .font(.omlxText(17, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                     .foregroundStyle(theme.text)
-                Text(String(localized: "update.confirm.subtitle",
-                            defaultValue: "Review the release notes before downloading and relaunching.",
-                            comment: "Subtitle for the update confirmation sheet"))
-                    .font(.omlxText(12))
+                Text(isStaged
+                     ? String(localized: "update.confirm.subtitle_ready",
+                              defaultValue: "The update is downloaded. Review the release notes before relaunching.",
+                              comment: "Subtitle for the update confirmation sheet when the update is already downloaded")
+                     : String(localized: "update.confirm.subtitle",
+                              defaultValue: "Review the release notes before downloading and relaunching.",
+                              comment: "Subtitle for the update confirmation sheet"))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
             }
             Spacer()
@@ -210,7 +234,7 @@ private struct UpdateConfirmationSheet: View {
                 Text(String(localized: "update.confirm.empty_notes",
                             defaultValue: "This release does not include detailed notes.",
                             comment: "Empty state when a GitHub release has no release notes"))
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -238,15 +262,24 @@ private struct UpdateConfirmationSheet: View {
     private var footer: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(String(localized: "update.confirm.size",
-                            defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
-                            comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
-                    .font(.omlxText(11))
+                if let error = updates.lastError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
+                        .foregroundStyle(theme.redDot)
+                }
+                Text(isStaged
+                     ? String(localized: "update.confirm.downloaded",
+                              defaultValue: "Downloaded and ready to install",
+                              comment: "Update confirmation footer line when the update is already downloaded")
+                     : String(localized: "update.confirm.size",
+                              defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
+                              comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "update.confirm.restart_notice",
                             defaultValue: "oMLX will quit, install the update, and relaunch.",
                             comment: "Notice explaining what happens after confirming an update"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer()
@@ -420,7 +453,7 @@ private struct ReleaseNotesImageGroup: View {
                                 .foregroundStyle(theme.textTertiary)
                             if !image.alt.isEmpty {
                                 Text(image.alt)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                     .multilineTextAlignment(.center)
                             }
@@ -451,7 +484,6 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
-                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)
@@ -460,6 +492,14 @@ private struct SettingsSidebar: View {
                 Text(String(localized: "sidebar.group.server",
                             defaultValue: "Server",
                             comment: "Sidebar group heading for server-related screens"))
+            }
+            Section {
+                SidebarRow(section: .appearance)
+                SidebarRow(section: .askAI)
+            } header: {
+                Text(String(localized: "sidebar.group.app",
+                            defaultValue: "App",
+                            comment: "Sidebar group heading for settings stored by the Mac app itself"))
             }
             Section {
                 SidebarRow(section: .models)
@@ -512,6 +552,9 @@ private struct SidebarRow: View {
 private struct ContentScaffold<Content: View>: View {
     let section: AppSection
     let detailTitle: String?
+    var detailSubtitle: String? = nil
+    /// The screen brings its own ScrollView, e.g. to reset scrolling per page.
+    var ownsScrollView = false
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
@@ -527,6 +570,10 @@ private struct ContentScaffold<Content: View>: View {
                     .frame(maxWidth: 720, alignment: .topLeading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.bottom, 18)
+                    .background(theme.windowBg)
+            } else if ownsScrollView {
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .background(theme.windowBg)
             } else {
                 ScrollViewReader { proxy in
@@ -565,6 +612,7 @@ private struct ContentScaffold<Content: View>: View {
             }
         }
         .navigationTitle(titleText)
+        .navigationSubtitle(detailSubtitle ?? "")
         .modifier(ToolbarHeightKeeper())
         .background(theme.windowBg)
     }

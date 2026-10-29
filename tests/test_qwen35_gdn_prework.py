@@ -13,21 +13,31 @@ from types import ModuleType, SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.gated_delta import normalize_qk
 from mlx_vlm.models.qwen3_5 import language
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops import linear as linear_ops
 
 
+from omlx.patches import qwen35_gdn_prework as prework_mod
+
+
 @pytest.fixture(autouse=True)
 def restore_hooks(monkeypatch):
     cls = language.Qwen3_5GatedDeltaNet
     monkeypatch.setattr(cls, "__call__", cls.__call__)
+    monkeypatch.setattr(cls, "_normalize_qk", cls._normalize_qk)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
+    monkeypatch.setattr(
+        verifier,
+        "_normalize_gated_delta_qk",
+        verifier.__dict__["_normalize_gated_delta_qk"],
+    )
+    prework_mod.apply_qwen35_vlm_qk_norm_patch()
 
 
-from omlx.patches import qwen35_gdn_prework as prework_mod
 from omlx.patches.qwen35_gdn_prework import (
     gdn_prework_fused,
     qwen4_decode_norm_gate_fused,
@@ -49,15 +59,13 @@ def _composed(qkv, conv_state, conv1d):
     q = q.reshape(B, S, HK, DK)
     k = k.reshape(B, S, HK, DK)
     v = v.reshape(B, S, HV, DV)
-    inv = DK**-0.5
-    q = (inv**2) * mx.fast.rms_norm(q, None, 1e-6)
-    k = inv * mx.fast.rms_norm(k, None, 1e-6)
+    q, k = normalize_qk(q, k, inv_scale=DK**-0.5, eps=1e-6)
     return q, k, v, new_state
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_fused_prework_bit_exact(seq, batch, dtype):
     mx.random.seed(11)
@@ -77,6 +85,21 @@ def test_fused_prework_bit_exact(seq, batch, dtype):
         assert bool((r == g).all().item()), f"{name} not bit-exact at S={seq}"
 
 
+def test_vlm_qk_norm_patch_matches_mlx_lm_normalize_qk():
+    """mlx-vlm added the l2norm eps to mean(x^2); tiny k rows expose it."""
+    mx.random.seed(3)
+    q = mx.random.normal((1, 2, HK, DK)).astype(mx.bfloat16)
+    k = (mx.random.normal((1, 2, HK, DK)) * 1e-3).astype(mx.bfloat16)
+    expected = normalize_qk(q, k, inv_scale=DK**-0.5, eps=1e-6)
+
+    layer = language.Qwen3_5GatedDeltaNet.__new__(language.Qwen3_5GatedDeltaNet)
+    for actual in (
+        layer._normalize_qk(q, k),
+        Qwen3_5BatchInvariantForward._normalize_gated_delta_qk(layer, q, k),
+    ):
+        assert all(mx.array_equal(a, e).item() for a, e in zip(actual, expected))
+
+
 def _composed_l2(qkv, conv_state, conv1d):
     """Stock Qwen4 chain: same prework, Qwen4 L2 q/k normalization."""
     batch, seq, _ = qkv.shape
@@ -93,7 +116,7 @@ def _composed_l2(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_fused_prework_l2_bit_exact(seq, batch):
     mx.random.seed(41)
@@ -594,6 +617,7 @@ def _canonical_qwen4_decode_module(signatures):
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
         ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e, every layer
     ],
 )
 def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
@@ -963,9 +987,10 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("seq", [8, 16])
 @pytest.mark.parametrize("batch,retained", [(1, [3]), (1, [8]), (3, [1, 8, 5])])
 def test_fused_verify_replays_committed_rows_in_the_next_block(
-    monkeypatch, batch, retained, dtype
+    monkeypatch, batch, retained, dtype, seq
 ):
     """The fused verify stores no per-row states: a commit leaves a lazy replay
     that the next block applies in its own launch. Outputs and committed states
@@ -987,7 +1012,6 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         linear_conv_kernel_dim=4,
         rms_norm_eps=1e-6,
     )
-    seq = 8
     mx.random.seed(71)
     module = q35.Qwen3_5GatedDeltaNet(args)
     module.set_dtype(dtype)
@@ -1036,29 +1060,90 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         assert same(actual, reference)
 
 
-def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
-    from omlx.scheduler import SchedulerConfig
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize(
+    "seq,retained", [(8, [8, 8, 8]), (8, [1, 8, 5]), (16, [3, 16, 11])]
+)
+def test_qwen4_verify_records_replay_rows_instead_of_states(
+    monkeypatch, seq, retained
+):
+    """The L2 verify keeps the stock output kernel but records the block rows,
+    so a batched transaction holds no state per position. Outputs and
+    committed states stay bit-exact to the stock recording across two blocks."""
+    import copy
 
+    q4 = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    ver_cls = getattr(q4, "_Qwen4Verifier", None) or getattr(
+        q4, "Qwen4ExpBatchInvariantForward", None
+    )
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    batch = 3
+    mx.random.seed(73)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.__class__ = type(
+        "Q4GatedDeltaNet",
+        (q35.Qwen3_5GatedDeltaNet,),
+        {"_normalize_qk": q4.Qwen4ExpGatedDeltaNet._normalize_qk},
+    )
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    blocks = [mx.random.normal((batch, seq, 64)).astype(mx.bfloat16) for _ in range(2)]
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+
+    def run(target, inputs):
+        transaction = start_speculative_cache([target], seq)
+        out = ver_cls()._gated_delta(module, inputs, None, target)
+        mx.eval(out)
+        return out, transaction
+
+    expected = []
+    for inputs in blocks:
+        out, transaction = run(reference_cache, inputs)
+        transaction.commit(retained)
+        expected.append(out)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    for index, inputs in enumerate(blocks):
+        out, transaction = run(cache, inputs)
+        assert cache._speculation["records"][1][0] == "replay"
+        assert mx.array_equal(out, expected[index]).item()
+        transaction.commit(retained)
+    assert getattr(cache, "_omlx_gdn_pending", None) is None
+    for actual, reference in zip(cache.state, reference_cache.state):
+        assert mx.array_equal(actual, reference).item()
+
+
+def test_qwen4_decode_setting_is_captured_per_model():
     module = _canonical_qwen4_decode_module(((8, 64),) * 4)
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
-    model = SimpleNamespace(modules=lambda: [module])
-    config = SchedulerConfig(qwen4_gdn_decode_wide_proj=True)
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
     prework_mod.configure_qwen4_decode(
-        model, wide_projections=config.qwen4_gdn_decode_wide_proj
+        SimpleNamespace(modules=lambda: [module]), wide_projections=True
     )
-    config.qwen4_gdn_decode_wide_proj = False
     assert prework_mod._qwen4_decode_static_eligible(module)
 
-    reloaded = _canonical_qwen4_decode_module(((8, 64),) * 4)
-    reloaded.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    other = _canonical_qwen4_decode_module(((8, 64),) * 4)
+    other.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
     prework_mod.configure_qwen4_decode(
-        SimpleNamespace(modules=lambda: [reloaded]),
-        wide_projections=config.qwen4_gdn_decode_wide_proj,
+        SimpleNamespace(modules=lambda: [other]), wide_projections=False
     )
-    assert not prework_mod._qwen4_decode_static_eligible(reloaded)
+    assert not prework_mod._qwen4_decode_static_eligible(other)
     assert prework_mod._qwen4_decode_static_eligible(module)
 
 
@@ -1158,6 +1243,7 @@ def patched_decode(monkeypatch):
     [
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
@@ -1233,8 +1319,8 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert not fallbacks
-    # 8-bit in-projections are outside the shipped allocation allow-list.
-    module.in_proj_qkv = _random_projection(2560, C, 8, 64)
+    # 8-bit/g128 in-projections are outside the shipped allocation allow-list.
+    module.in_proj_qkv = _random_projection(2560, C, 8, 128)
     _decode_steps(
         module,
         [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
@@ -1272,9 +1358,9 @@ def qwen4_verify(monkeypatch):
     launches = []
     step = prework_mod.qwen4_verify_step_fused
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         launches.append(args[0].shape[1])
-        return step(*args)
+        return step(*args, **kwargs)
 
     monkeypatch.setattr(prework_mod, "qwen4_verify_step_fused", counted)
     yield launches
@@ -1330,10 +1416,11 @@ _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9])
 @pytest.mark.parametrize("seed", [3, 11])
+@pytest.mark.parametrize("deferred", [True, False])
 def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
-    monkeypatch, qwen4_verify, signatures, rows, seed
+    monkeypatch, qwen4_verify, signatures, rows, seed, deferred
 ):
     """Outputs, next states, rollback records and every accepted prefix."""
     import copy
@@ -1341,10 +1428,17 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     from mlx.utils import tree_flatten
 
     module = _real_qwen4_decode_module(signatures, seed)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", deferred)
     inputs, conv_state, recurrent_state = _verify_inputs(rows, seed + rows)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", False)
+    # The reference keeps the stock per-step state records.
+    replay = prework_mod.qwen35_gdn_verify_fused.replay_eligible
+    monkeypatch.setattr(
+        prework_mod.qwen35_gdn_verify_fused, "replay_eligible", lambda *args: False
+    )
     want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == []
+    monkeypatch.setattr(prework_mod.qwen35_gdn_verify_fused, "replay_eligible", replay)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", True)
     got, got_cache, got_tx = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == [rows]
@@ -1358,10 +1452,17 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     assert got_window[0] == kind == "window" and got_window[2] == width == 3
     assert _same(want_window, got_window[1])
     (kind, want_history, want_final), got_states = want_records[1], got_records[1]
-    assert got_states[0] == kind == "states"
+    assert kind == "states"
     if rows == 1:
+        assert got_states[0] == "states"
         assert want_history is None and got_states[1] is None
+    elif deferred:
+        # No per-step states are written; each is recomputed on demand.
+        assert got_states[0] == "deferred" and got_states[3] == rows
+        for kept in range(1, rows):
+            assert _same(want_history[:, kept - 1], got_states[4](kept)), kept
     else:
+        assert got_states[0] == "states"
         assert _same(want_history, got_states[1])
     assert _same(want_final, got_states[2])
     for keep in range(rows + 1):
@@ -1378,7 +1479,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, rows, seed
@@ -1414,11 +1515,12 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     for t in range(rows):
         assert _same(outputs[t][:, 0], got[:, t]), t
     window = cache._speculation["records"][0][1]
-    _, history, final = cache._speculation["records"][1]
+    kind, _, final, _, state_after = cache._speculation["records"][1]
+    assert kind == "deferred"
     for t in range(rows + 1):
         assert _same(convs[t], window[:, t : t + 3]), t
     for t in range(rows - 1):
-        assert _same(states[t + 1], history[:, t]), t
+        assert _same(states[t + 1], state_after(t + 1)), t
     assert _same(states[rows], final)
     assert _same(convs[rows], cache[0]) and _same(states[rows], cache[1])
     for keep in range(rows + 1):
@@ -1429,12 +1531,87 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
+@pytest.mark.parametrize("rows", [2, 3])
+def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
+    monkeypatch, qwen4_verify, signatures, rows
+):
+    """Up to the per-row projection limit, every row of a batched one-token
+    decode, and its next conv and recurrent states, equal that row decoded
+    alone (B1) bit for bit."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
+    module = _real_qwen4_decode_module(signatures, 17)
+    mx.random.seed(rows)
+    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    recurrent_state = mx.random.normal((rows, HV, DV, DK)) * 0.05
+    batch = ArraysCache(size=2)
+    batch[0], batch[1] = conv_state, recurrent_state
+    engaged = []
+    launch = prework_mod.qwen4_batch_decode_step_fused
+
+    def counted(*args):
+        engaged.append(args[0].shape[0])
+        return launch(*args)
+
+    monkeypatch.setattr(prework_mod, "qwen4_batch_decode_step_fused", counted)
+    got = module(inputs, cache=batch)
+    mx.eval(got, batch[0], batch[1])
+    assert engaged == [rows]
+    for r in range(rows):
+        alone = ArraysCache(size=2)
+        alone[0], alone[1] = conv_state[r : r + 1], recurrent_state[r : r + 1]
+        want = module(inputs[r : r + 1], cache=alone)
+        mx.eval(want, alone[0], alone[1])
+        assert _same(want, got[r : r + 1]), r
+        assert _same(alone[0], batch[0][r : r + 1]), r
+        assert _same(alone[1], batch[1][r : r + 1]), r
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 5, 8, 16])
+def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
+    """Each row of the batched step launch (outputs, next conv and recurrent
+    states) equals the B1 decode step on that row's inputs and states."""
+    mx.random.seed(40 + rows)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(mx.bfloat16)
+    q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
+    A_log = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    dt_bias = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    norm_w = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
+    eps = mx.array(1e-6, dtype=mx.float32)
+    qkv = (mx.random.normal((rows, 1, C)) * 0.8).astype(mx.bfloat16)
+    z = (mx.random.normal((rows, 1, HV * DV)) * 0.8).astype(mx.bfloat16)
+    b = (mx.random.normal((rows, 1, HV)) * 0.8).astype(mx.bfloat16)
+    a = (mx.random.normal((rows, 1, HV)) * 0.8).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    state = mx.random.normal((rows, HV, DV, DK)) * 0.1
+    operands = (conv_w, q_scale, A_log, dt_bias)
+    conv_out, state_out, out = prework_mod.qwen4_batch_decode_step_fused(
+        qkv, z, b, a, conv_state, *operands, state, norm_w, eps, HK, HV, DK, DV
+    )
+    for r in range(rows):
+        row = slice(r, r + 1)
+        want = prework_mod.qwen4_decode_step_fused(
+            qkv[row], z[row], b[row], a[row], conv_state[row], *operands, state[row],
+            norm_w, eps, HK, HV, DK, DV,
+        )
+        for have, expected in zip((conv_out[row], state_out[row], out[row]), want):
+            assert _same(expected, have), r
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [1, 2, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 4, 9, 16])
 @pytest.mark.parametrize("seed", [7, 29])
 def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
     """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
     output and gate products that BF16 rounds away."""
+    if dtype == mx.float32 and rows > 9:
+        pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
+                    "served verify windows are BF16")
     mx.random.seed(seed)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)

@@ -16,6 +16,11 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import _BaseCache
 
+# Widest single update whose pooling remainder can still be rolled back
+# through the undo log. Depth-k MTP chains and batched DFlash blocks verify
+# at most 8 tokens.
+POOLING_UNDO_MAX_TOKENS = 16
+
 
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
@@ -143,12 +148,13 @@ class PoolingCache(_BaseCache):
 
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
-        # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 8 covers depth-k chain verify windows) are
-        # ever trimmed; skipping the stash for prompt chunks avoids pinning
-        # large prefill projections. Buffer slices are taken before any
-        # mutation, so they reference the pre-update array node.
-        if L <= 8:
+        # token when it completed a pool window. Only decode / MTP-verify /
+        # DFlash-verify sized updates (POOLING_UNDO_MAX_TOKENS covers depth-k
+        # chain and DFlash verify windows) are ever trimmed;
+        # skipping the stash for prompt chunks avoids pinning large prefill
+        # projections. Buffer slices are taken before any mutation, so they
+        # reference the pre-update array node.
+        if L <= POOLING_UNDO_MAX_TOKENS:
             try:
                 from omlx.patches.mlx_lm_mtp import cache_rollback
 
@@ -1001,6 +1007,12 @@ class BatchPoolingCache(_BaseCache):
             self.prev_win_kv = self.prev_win_kv[batch_indices]
             self.prev_win_gate = self.prev_win_gate[batch_indices]
         self._prev_valid = [self._prev_valid[i] for i in idx_list]
+        # Pooled rows are right-padded to the widest row. Columns past the longest *remaining* row are padding for every
+        # remaining row (e.g. a long request finished and left a short one): drop them, so a request left alone holds
+        # exactly the pooled rows it would hold had it never been batched. Every path benefits: the stock path stops
+        # masking dead columns, and the decode-consistent exact paths (which attend every column) stay correct.
+        if self._pool_buf is not None:
+            self._pool_extent = min(self._pool_extent, max(self._pool_lengths, default=0))
 
     def extend(self, other):
         # Merge the remainder buffers

@@ -7,8 +7,20 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def bracket_host(host: str) -> str:
+    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
+
+    ``http://::1:8000`` is not a valid URL (requests rejects it with
+    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
+    hostnames, and already-bracketed literals pass through unchanged.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 @dataclass(frozen=True)
@@ -29,10 +41,15 @@ class IntegrationContext:
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
     cross_session: bool = False
+    # Per-model status/capacity map the launcher pre-fetched from
+    # GET /v1/models/status (keys: model id and model_alias). Integrations
+    # read it instead of fetching the status again themselves; empty for
+    # direct constructions.
+    models_status_map: dict[str, dict] = field(default_factory=dict)
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{bracket_host(self.host)}:{self.port}"
 
     @property
     def openai_base_url(self) -> str:
@@ -56,6 +73,12 @@ class Integration:
     type: str  # "env_var" or "config_file"
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
+
+    # Whether `omlx launch <tool>` must interactively pick a model. Tools
+    # that configure one model into their config need a pick; tools that
+    # register the server's whole model catalog (dsh) do not, and resolve
+    # their optional default from `--model` / the saved per-tool setting.
+    requires_model_selection: bool = True
 
     def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
@@ -174,23 +197,47 @@ class Integration:
                 print("Creating new config file.")
                 existing = {}
 
-            # Create timestamped backup
-            timestamp = int(time.time())
-            backup = config_path.with_suffix(f".{timestamp}.bak")
-            try:
-                shutil.copy2(config_path, backup)
-                print(f"Backup: {backup}")
-            except OSError as e:
-                print(f"Warning: could not create backup: {e}")
-
         updater(existing)
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        print(f"Config written: {config_path}")
+        payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
+        backup_then_write(config_path, payload)
+
+
+def backup_then_write(
+    path: Path,
+    text: str,
+    *,
+    failure: str = "could not create backup",
+    note: str = "Config written",
+    mode: int | None = None,
+) -> None:
+    """Back up an existing config, then write ``text`` over it.
+
+    Best effort: a config that cannot be backed up is still written, and a
+    failed copy only earns a warning. ``mode`` applies only when the file
+    is created.
+    """
+    if path.exists():
+        backup = path.with_suffix(f".{int(time.time())}.bak")
+        try:
+            shutil.copy2(path, backup)
+            print(f"Backup: {backup}")
+        except OSError as e:
+            print(f"Warning: {failure}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is not None:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            # Existing file: write in place and keep its mode.
+            path.write_text(text, encoding="utf-8")
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+    else:
+        path.write_text(text, encoding="utf-8")
+    print(f"{note}: {path}")
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:

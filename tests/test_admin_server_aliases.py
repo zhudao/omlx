@@ -16,6 +16,8 @@ import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.utils.network as network
 from omlx.admin.routes import GlobalSettingsRequest
+from omlx.scheduler import SchedulerConfig
+from omlx.server import _server_state
 from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
@@ -836,12 +838,7 @@ class TestApplyCacheSettingsRuntimeGdn:
 
         with patch.object(_server_state, "engine_pool", pool):
             success, _message = asyncio.run(
-                admin_routes._apply_cache_settings_runtime(
-                    None,
-                    None,
-                    None,
-                    gs,
-                )
+                admin_routes._apply_cache_settings_runtime(None, gs)
             )
 
         assert success is True
@@ -1076,6 +1073,61 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         assert gs.scheduler.embedding_batch_size == 32
 
 
+class TestUpdateGlobalSettingsMaxConcurrentRequests:
+    """update_global_settings: saving and hot-applying max concurrent requests."""
+
+    def _setup(self, validate_errors=()):
+        gs = MagicMock()
+        gs.scheduler = SimpleNamespace(
+            max_concurrent_requests=1,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+        gs.validate.return_value = list(validate_errors)
+        gs.save.return_value = None
+        return gs, SimpleNamespace(apply_max_concurrent_requests=AsyncMock())
+
+    def _save(self, gs, pool, value):
+        request = GlobalSettingsRequest(max_concurrent_requests=value)
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+        ):
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+    def test_saves_and_hot_applies_max_concurrent_requests(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 4)
+
+        assert "max_concurrent_requests" in result["runtime_applied"]
+        assert gs.scheduler.max_concurrent_requests == 4
+        pool.apply_max_concurrent_requests.assert_awaited_once_with(4)
+
+    def test_unchanged_value_is_not_hot_applied(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 1)
+
+        assert "max_concurrent_requests" not in result["runtime_applied"]
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+
+    def test_does_not_hot_apply_when_validation_fails(self):
+        gs, pool = self._setup(validate_errors=["invalid max_concurrent_requests"])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._save(gs, pool, 0)
+
+        assert exc_info.value.status_code == 400
+        assert gs.scheduler.max_concurrent_requests == 1
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+        gs.save.assert_not_called()
+
+
 class TestUpdateGlobalSettingsGdnSidecarStateDtype:
     """update_global_settings: GDN sidecar precision invariants.
 
@@ -1303,23 +1355,33 @@ def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
         assert gs.cache.gdn_ssd_split_enabled is split
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_qwen4_decode_setting_updates_future_model_loads(enabled):
-    from omlx.scheduler import SchedulerConfig
-    from omlx.server import _server_state
+def test_unavailable_ssd_cache_dir_stays_off_on_save(tmp_path):
+    not_a_dir = tmp_path / "not-a-dir"
+    not_a_dir.write_text("")
+    gs = GlobalSettings(base_path=tmp_path / "omlx")
+    gs.cache.ssd_cache_dir = str(not_a_dir / "cache")
+    gs.cache.ssd_cache_max_size = "1GB"
+    gs.ensure_directories()
+    gs.save = MagicMock()
 
-    gs = _make_global_settings()
-    gs.server.qwen4_gdn_decode_wide_proj = not enabled
-    pool = SimpleNamespace(
-        _scheduler_config=SchedulerConfig(qwen4_gdn_decode_wide_proj=not enabled)
-    )
-    request = GlobalSettingsRequest(qwen4_gdn_decode_wide_proj=enabled)
-    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
-        result = asyncio.run(
-            admin_routes.update_global_settings(request=request, is_admin=True)
-        )
-    assert result["success"] is True
-    assert "qwen4_gdn_decode_wide_proj" not in result["runtime_applied"]
-    assert gs.server.qwen4_gdn_decode_wide_proj is enabled
-    assert pool._scheduler_config.qwen4_gdn_decode_wide_proj is enabled
-    gs.save.assert_called_once()
+    # The dashboard sends the configured dir back. It is not a dir change.
+    request = GlobalSettingsRequest(ssd_cache_dir=gs.cache.ssd_cache_dir)
+    with (
+        _patched_global_settings(gs),
+        patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            new_callable=AsyncMock,
+            return_value=(True, "applied"),
+        ) as apply_cache,
+    ):
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+    apply_cache.assert_not_awaited()
+
+    pool = MagicMock()
+    pool._scheduler_config = SchedulerConfig(paged_ssd_cache_dir="/tmp/cache")
+    pool.get_loaded_model_ids.return_value = []
+    with patch.object(_server_state, "engine_pool", pool):
+        asyncio.run(admin_routes._apply_cache_settings_runtime(None, gs))
+    assert pool._scheduler_config.paged_ssd_cache_dir is None
+    assert pool._scheduler_config.paged_ssd_cache_max_size == 0

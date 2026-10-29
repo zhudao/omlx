@@ -783,6 +783,11 @@ class PagedCacheManager(CacheManager):
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                     self._notify_hash_dropped(block.block_hash)
 
+                # Free-queue blocks carry no hash or token count.
+                block.reset_hash()
+                self.stats.total_tokens_cached -= block.token_count
+                block.token_count = 0
+
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
 
@@ -791,45 +796,10 @@ class PagedCacheManager(CacheManager):
 
                 self.stats.allocated_blocks -= 1
                 self.stats.free_blocks += 1
-                self.stats.total_tokens_cached -= block.token_count
 
                 return True
 
             return False
-
-    def free_blocks(self, blocks: Iterable[CacheBlock]) -> None:
-        """
-        Free multiple blocks (vLLM style).
-
-        Blocks with ref_count=0 are added to the free queue.
-
-        Args:
-            blocks: Blocks to free (in eviction order)
-        """
-        with self._lock:
-            blocks_list = list(blocks)
-            to_free = []
-
-            for block in blocks_list:
-                if block.is_null:
-                    continue
-
-                block.ref_count -= 1
-
-                if block.ref_count <= 0:
-                    # Remove from hash cache
-                    if block.block_hash is not None:
-                        self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
-                        self._notify_hash_dropped(block.block_hash)
-
-                    del self.allocated_blocks[block.block_id]
-                    to_free.append(block)
-                    self.stats.allocated_blocks -= 1
-                    self.stats.free_blocks += 1
-                    self.stats.total_tokens_cached -= block.token_count
-
-            # Add to free queue (back = MRU, evicted last)
-            self.free_block_queue.append_n(to_free)
 
     def touch(self, blocks: Iterable[CacheBlock]) -> None:
         """
@@ -1282,6 +1252,11 @@ class PagedCacheManager(CacheManager):
                 self.request_tables[request_id] = BlockTable(request_id=request_id)
             return self.request_tables[request_id]
 
+    def detach_block_table(self, request_id: str) -> Optional[BlockTable]:
+        """Remove a request's block table without freeing its blocks."""
+        with self._lock:
+            return self.request_tables.pop(request_id, None)
+
     def delete_block_table(self, request_id: str) -> None:
         """Delete block table and free associated blocks."""
         with self._lock:
@@ -1605,7 +1580,7 @@ class PagedCacheManager(CacheManager):
                 return False
 
             if block.is_null:
-                logger.warning(f"Cannot mark null block")
+                logger.warning("Cannot mark null block")
                 return False
 
             # In paged SSD-only mode, data is already on paged SSD
@@ -1648,7 +1623,7 @@ class PagedCacheManager(CacheManager):
                 return False
 
             if block.is_null:
-                logger.warning(f"Cannot evict null block")
+                logger.warning("Cannot evict null block")
                 return False
 
             # Remove from hash cache
@@ -1665,8 +1640,16 @@ class PagedCacheManager(CacheManager):
                 del self.allocated_blocks[block_id]
                 self.stats.allocated_blocks -= 1
 
-            self.free_block_queue.append(block)
-            self.stats.free_blocks += 1
+            # Only return the block to the free queue if it is not already
+            # in it: get_evictable_blocks() walks the free queue itself, so
+            # most evictees are already linked. Re-appending would corrupt
+            # the chain (num_free_blocks over-counted, two popleft()s can
+            # return the same block, and the relink orphans the middle of
+            # the list). Membership test: append/popleft/remove keep
+            # next_free_block non-None iff linked.
+            if block.next_free_block is None:
+                self.free_block_queue.append(block)
+                self.stats.free_blocks += 1
             self.stats.evictions += 1
 
             logger.debug(f"Permanently evicted block {block_id}")

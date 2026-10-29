@@ -12,6 +12,8 @@ inputs must produce non-trivial diversity at temperature > 0.
 
 from __future__ import annotations
 
+import random
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -23,6 +25,8 @@ from omlx.utils.sampling import (
     apply_xtc,
     categorical_sampling,
     make_sampler,
+    make_shared_sampler,
+    select_logprobs,
 )
 
 
@@ -100,6 +104,34 @@ def test_apply_top_p_masks_tail_tokens():
     assert out_np[0, 4] == logprobs_np[0, 4]
     # The lowest-logprob token must be masked to -inf with top_p=0.5
     assert np.isinf(out_np[0, 0]) and out_np[0, 0] < 0
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_apply_top_p_keeps_the_top_token_at_tiny_thresholds(dtype):
+    """A low-precision cumulative sum used to mask every token (mlx-lm #1912)."""
+    mx.random.seed(0)
+    logits = mx.random.normal((2, 4096)) * 3
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    for top_p in (1e-8, 1e-4, 1e-3):
+        filtered = apply_top_p(logprobs, top_p)
+        assert ((filtered > -float("inf")).sum(axis=-1) > 0).all().item()
+        assert filtered.max(axis=-1).tolist() == logprobs.max(axis=-1).tolist()
+
+
+def test_apply_xtc_threshold_is_per_row():
+    """A batch row must not take its cutoff from another row's probabilities."""
+    logits = mx.log(mx.array([[0.5, 0.3, 0.2], [0.05, 0.15, 0.8]]))
+    out = apply_xtc(
+        logits, xtc_probability=1.0, xtc_threshold=0.1, xtc_special_tokens=[]
+    )
+    # Each row keeps only its own lowest above-threshold token and below.
+    assert (out > -float("inf")).tolist() == [[False, False, True], [True, True, False]]
+
+
+def test_apply_min_p_keeps_min_tokens():
+    logprobs = mx.log(mx.array([[0.9, 0.0, 0.0, 0.1]]))
+    out = apply_min_p(logprobs, 0.5, min_tokens_to_keep=2)
+    assert (out > -float("inf")).tolist() == [[True, False, False, True]]
 
 
 def test_apply_top_k_keeps_only_k_tokens():
@@ -289,3 +321,96 @@ def test_top_k_indices_matches_full_sort(vocab, top_k):
     expected = mx.sort(mx.argsort(-values, axis=-1)[:, :top_k], axis=-1)
     actual = mx.sort(top_k_indices(values, top_k), axis=-1)
     assert mx.array_equal(expected, actual).item()
+
+
+def test_make_shared_sampler_reuses_one_object_per_parameter_set():
+    sampler = make_shared_sampler(temp=0.7, top_p=0.95, top_k=20)
+    assert make_shared_sampler(temp=0.7, top_p=0.95, top_k=20) is sampler
+    assert make_shared_sampler(temp=0.7, top_p=0.95, top_k=40) is not sampler
+    xtc = dict(temp=1.0, xtc_probability=0.5, xtc_threshold=0.1)
+    assert make_shared_sampler(**xtc) is not make_shared_sampler(**xtc)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(temp=0.7, top_p=0.95, top_k=20), dict(temp=0.7, min_p=0.05, top_k=50)],
+)
+def test_shared_sampler_filters_a_batch_like_one_row_calls(kwargs):
+    sampler = make_shared_sampler(**kwargs)
+    logits = mx.random.normal((8, 128 * 80), key=mx.random.key(0)) * 4.0
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    rows = mx.concatenate(
+        [sampler._mtp_sampling_logits(logprobs[e : e + 1]) for e in range(8)], axis=0
+    )
+    assert mx.array_equal(sampler._mtp_sampling_logits(logprobs), rows).item()
+
+
+def _reference_no_repeat_ngram(sequence, ngram_size, window):
+    """Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor for one row.
+
+    ``window=0`` searches the whole sequence, which is transformers'
+    ``no_repeat_ngram_size``.
+    """
+    if len(sequence) < ngram_size:
+        return set()
+    search_start = max(0, len(sequence) - window) if window else 0
+    search_end = len(sequence) - ngram_size + 1
+    if search_end <= search_start:
+        return set()
+    current_prefix = tuple(sequence[-(ngram_size - 1) :]) if ngram_size > 1 else ()
+    banned = set()
+    for idx in range(search_start, search_end):
+        ngram = sequence[idx : idx + ngram_size]
+        if ngram_size == 1 or tuple(ngram[:-1]) == current_prefix:
+            banned.add(ngram[-1])
+    return banned
+
+
+@pytest.mark.parametrize("dtype", [mx.int32, mx.uint32])
+def test_no_repeat_ngram_matches_reference(dtype):
+    from omlx.utils.sampling import make_no_repeat_ngram_processor
+
+    rng = random.Random(0)
+    for _ in range(400):
+        vocab = rng.choice([6, 64])
+        alphabet = rng.randint(1, 4)
+        sequence = [rng.randrange(alphabet) for _ in range(rng.randint(0, 48))]
+        ngram_size = rng.choice([1, 2, 3, 5])
+        # Windows shorter and longer than the sequence, and none at all.
+        window = rng.choice([0, ngram_size, ngram_size + 4, 16, 100])
+        logits = mx.random.normal((1, vocab)).astype(mx.bfloat16)
+
+        processor = make_no_repeat_ngram_processor(ngram_size, window)
+        out = processor(mx.array(sequence, dtype=dtype), logits)
+
+        expected = _reference_no_repeat_ngram(sequence, ngram_size, window)
+        assert out.dtype == logits.dtype
+        banned = mx.isinf(out[0]).tolist()
+        assert {i for i, b in enumerate(banned) if b} == expected
+        kept = mx.logical_not(mx.isinf(out))
+        assert mx.array_equal(mx.where(kept, out, 0), mx.where(kept, logits, 0)).item()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tol"), [(mx.bfloat16, 0.07), (mx.float16, 0.01), (mx.float32, 1e-5)]
+)
+def test_select_logprobs_reads_batch_rows_on_host(dtype, tol):
+    rng = np.random.default_rng(0)
+    logits = mx.array(
+        np.stack([rng.permutation(64) * 0.25 - 8 for _ in range(3)]), dtype=dtype
+    )
+    rows = list(logits - mx.logsumexp(logits, axis=-1, keepdims=True))
+    mx.eval(rows)
+    ref = logits.astype(mx.float32)
+    ref = np.array(ref - mx.logsumexp(ref, axis=-1, keepdims=True))
+
+    chosen, top = select_logprobs(rows[1], 5, 3)
+
+    assert chosen == pytest.approx(ref[1, 5], abs=tol)
+    assert [token for token, _ in top] == np.argsort(-ref[1])[:3].tolist()
+    assert [value for _, value in top] == pytest.approx(
+        np.sort(ref[1])[::-1][:3], abs=tol
+    )
+    assert select_logprobs(rows[1], 5, 0)[1] == []
+    forced = mx.array([-float("inf"), 0.0, -float("inf")])
+    assert select_logprobs(forced, 1, 3) == (0.0, [(1, 0.0)])

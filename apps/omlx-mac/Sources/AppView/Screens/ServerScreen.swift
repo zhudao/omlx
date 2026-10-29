@@ -248,7 +248,7 @@ private struct ModelDirectoriesEditor: View {
                     Text(String(localized: "server.row.models_directories",
                                 defaultValue: "Model Directories",
                                 comment: "Row label for the model directories editor"))
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(String(localized: "server.row.models_directories.sub",
                                 defaultValue: "The first path is the download target. All paths are scanned for local models.",
@@ -283,7 +283,7 @@ private struct ModelDirectoriesEditor: View {
                           defaultValue: "Primary",
                           comment: "Badge for the first model directory")
                  : String(format: "#%d", index + 1))
-                .font(.omlxMono(10, weight: .semibold))
+                .font(.omlxMono(DesignTokens.FontSize.caption, weight: .semibold))
                 .foregroundStyle(index == 0 ? theme.accent : theme.textSecondary)
                 .frame(width: 52, alignment: .leading)
 
@@ -652,25 +652,34 @@ private struct APIEndpointsList: View {
             Row(label: String(localized: "server.endpoint.openai",
                               defaultValue: "OpenAI-compatible",
                               comment: "API endpoint row label for the OpenAI-compatible base URL")) {
-                CodeChip(value: "http://\(host):\(port)/v1")
+                CodeChip(value: endpoint(path: "/v1"))
             }
             Row(label: String(localized: "server.endpoint.anthropic",
                               defaultValue: "Anthropic / Claude Code",
                               comment: "API endpoint row label for the Anthropic/Claude Code base URL")) {
-                CodeChip(value: "http://\(host):\(port)")
+                CodeChip(value: endpoint(path: ""))
             }
             Row(label: String(localized: "server.endpoint.health",
                               defaultValue: "Health probe",
                               comment: "API endpoint row label for the health probe URL")) {
-                CodeChip(value: "http://\(host):\(port)/health")
+                CodeChip(value: endpoint(path: "/health"))
             }
             Row(label: String(localized: "server.endpoint.metrics",
                               defaultValue: "Metrics (Prometheus)",
                               comment: "API endpoint row label for the Prometheus metrics URL"),
                 isLast: true) {
-                CodeChip(value: "http://\(host):\(port)/metrics")
+                CodeChip(value: endpoint(path: "/metrics"))
             }
         }
+    }
+
+    /// Build via `AppConfig.httpURL` so an IPv6 literal host is bracketed
+    /// (`http://[::1]:8000/v1`) instead of the malformed `http://::1:8000/v1`
+    /// raw interpolation would produce. Fall back to interpolation only if the
+    /// URL is somehow unconstructable.
+    private func endpoint(path: String) -> String {
+        AppConfig.httpURL(host: host, port: port, path: path)?.absoluteString
+            ?? "http://\(host):\(port)\(path)"
     }
 }
 
@@ -705,7 +714,7 @@ private struct ServerAdvancedSection: View {
                     Text(String(localized: "server.section.advanced",
                                 defaultValue: "Advanced",
                                 comment: "Disclosure header for the advanced server settings"))
-                        .font(.omlxText(11, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
                         .kerning(0.6)

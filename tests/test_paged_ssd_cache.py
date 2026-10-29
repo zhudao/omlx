@@ -32,6 +32,7 @@ from omlx.cache.paged_ssd_cache import (
     _restore_tensor_from_bytes,
     _signature_turboquant_bits,
     _write_safetensors_no_mx,
+    numerics_revision_for_model,
     parse_size,
 )
 
@@ -761,6 +762,75 @@ class TestPagedSSDCacheManagerWithMLX:
         for keys, values in loaded:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
+
+    @pytest.mark.parametrize(
+        "original_layers",
+        [
+            pytest.param(0, id="new"),
+            pytest.param(1, id="incompatible"),
+            pytest.param(2, id="clean"),
+        ],
+    )
+    def test_close_persists_current_hot_cache_payload(
+        self, tmp_path: Path, mock_mlx, original_layers
+    ):
+        mx = mock_mlx
+        block_hash = b"\x41" * 32
+
+        def make_manager(layers, hot_cache_bytes):
+            return PagedSSDCacheManager(
+                cache_dir=tmp_path / "ssd_cache",
+                max_size_bytes=1024**2,
+                hot_cache_max_bytes=hot_cache_bytes,
+                expected_model_name="test-model",
+                expected_num_layers=layers,
+                expected_block_size=2,
+                expected_layer_cache_types=["KVCache"] * layers,
+            )
+
+        def save(manager, layers):
+            return manager.save_block(
+                block_hash,
+                [(mx.ones((1, 1, 2, 1)), mx.ones((1, 1, 2, 1))) for _ in range(layers)],
+                token_count=2,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * layers,
+            )
+
+        if original_layers:
+            original = make_manager(original_layers, 0)
+            try:
+                assert save(original, original_layers)
+            finally:
+                original.close()
+
+        manager = make_manager(2, 1024**2)
+        try:
+            if original_layers == 2:
+                assert manager.load_block(block_hash) is not None
+                assert not manager._hot_cache_get(block_hash)["dirty"]
+            else:
+                assert not manager.has_block(block_hash)
+                assert save(manager, 2)
+                assert manager._hot_cache_get(block_hash)["dirty"]
+        finally:
+            with patch.object(
+                manager, "_enqueue_ssd_write", wraps=manager._enqueue_ssd_write
+            ) as enqueue:
+                manager.close()
+        if original_layers == 2:
+            enqueue.assert_not_called()
+
+        reopened = make_manager(2, 1024**2)
+        try:
+            restored = reopened.load_block(block_hash)
+            assert restored is not None
+            assert len(restored) == 2
+            for keys, values in restored:
+                assert mx.array_equal(keys, mx.ones((1, 1, 2, 1))).item()
+                assert mx.array_equal(values, mx.ones((1, 1, 2, 1))).item()
+        finally:
+            reopened.close()
 
     def test_save_block_persists_tail_metadata_and_reindexes(
         self, tmp_path: Path, mock_mlx
@@ -1814,6 +1884,88 @@ class TestAsyncWriteAndTimeoutLoad:
                 time.sleep(0.01)
             with manager._hot_cache_lock:
                 assert manager._hot_cache[block_hash]["dirty"] is False
+        finally:
+            release_writer.set()
+            manager.close()
+
+    def test_bounded_pending_writes_waits_for_the_writer(self, tmp_path, mx):
+        """A bounded store serializes no further block while the queue is full."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "bounded_pending",
+            max_size_bytes=100 * 1024**2,
+        )
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))]
+        second_saved = threading.Event()
+
+        def save(block_hash):
+            return manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                layer_meta_states=[(16,)],
+            )
+
+        def save_second():
+            save(b"bounded_second")
+            second_saved.set()
+
+        try:
+            with manager.bounded_pending_writes(1):
+                assert save(b"bounded_first")
+                thread = threading.Thread(target=save_second)
+                thread.start()
+                assert not second_saved.wait(timeout=0.2)
+                release_writer.set()
+                assert second_saved.wait(timeout=5)
+                thread.join(timeout=5)
+        finally:
+            release_writer.set()
+            manager.close()
+
+    def test_staged_write_stays_out_of_hot_cache_bytes(self, tmp_path, mx):
+        """With the hot cache off, queued writes never count as hot bytes."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "staged_bytes",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        try:
+            for i in range(3):
+                assert manager.save_block(
+                    block_hash=f"staged_bytes_{i}".encode(),
+                    cache_data=[(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))],
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"],
+                )
+            assert manager.get_stats().hot_cache_size_bytes == 0
+
+            release_writer.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with manager._pending_write_hashes_lock:
+                    if not manager._pending_write_hashes:
+                        break
+                time.sleep(0.01)
+            assert manager._hot_cache_total_bytes == 0
         finally:
             release_writer.set()
             manager.close()
@@ -4168,6 +4320,8 @@ class TestLayerSignatureSweep:
             tmp_path,
             expected_layer_cache_types=["ArraysCache", "KVCache"],
         )
+        # The first call also pins the numerics revision.
+        assert mgr.set_expected_layer_signature(["ArraysCache", "KVCache"]) is True
         mgr._signature_sweep_completed = True
 
         changed = mgr.set_expected_layer_signature(["SizedArraysCache", "KVCache"])
@@ -4183,6 +4337,8 @@ class TestLayerSignatureSweep:
             tmp_path,
             expected_layer_cache_types=["KVCache", "RotatingKVCache"],
         )
+        # The first call also pins the numerics revision.
+        assert mgr.set_expected_layer_signature(["KVCache", "RotatingKVCache"]) is True
         mgr._signature_sweep_completed = True
 
         changed = mgr.set_expected_layer_signature(
@@ -4331,6 +4487,101 @@ class TestLayerSignatureSweep:
         # Same call signature — already set, returns False, flag stays.
         assert mgr.adopt_layer_signature_if_unset(["ArraysCache", "KVCache"]) is False
         assert mgr._signature_sweep_completed is True
+
+
+class TestNumericsSignature:
+    """Blocks computed before a model's numerics changed must not be reused.
+
+    mlx-lm's Qwen3.5 GDN q/k norm eps changed with the 94cdcae pin, so KV and
+    GDN state saved earlier by the mlx-lm path diverge from a fresh prefill.
+    """
+
+    HYBRID = ["ArraysCache", "KVCache", "ArraysCache", "KVCache"]
+    REVISION = "gdn-qk-norm-2"
+
+    def _make_meta(self, *, block_hash: bytes, numerics: str | None):
+        now = time.time()
+        return PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=Path("/tmp/never-touched.safetensors"),
+            file_size=1024,
+            token_count=2048,
+            created_at=now,
+            last_access=now,
+            num_layers=4,
+            model_name="test-model",
+            block_size=2048,
+            layer_cache_types=self.HYBRID,
+            cache_signature=_cache_compat_signature(
+                model_name="test-model",
+                num_layers=4,
+                block_size=2048,
+                layer_cache_types=self.HYBRID,
+                numerics=numerics,
+            ),
+        )
+
+    def _make_manager(self, tmp_path: Path, numerics: str | None):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1 << 30,
+            expected_model_name="test-model",
+            expected_num_layers=4,
+            expected_block_size=2048,
+        )
+        manager.set_expected_layer_signature(self.HYBRID, numerics=numerics)
+        return manager
+
+    def test_revision_follows_the_live_model_modules(self):
+        nn = pytest.importorskip("mlx.nn")
+        qwen35 = pytest.importorskip("mlx_lm.models.qwen3_5")
+        args = qwen35.TextModelArgs(
+            model_type="qwen3_5",
+            hidden_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=128,
+            linear_num_value_heads=2,
+            linear_num_key_heads=1,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=4,
+        )
+
+        assert numerics_revision_for_model(qwen35.GatedDeltaNet(args)) == (
+            self.REVISION
+        )
+        assert numerics_revision_for_model(nn.Linear(4, 4)) is None
+
+    def test_sweep_drops_blocks_from_other_numerics(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path, self.REVISION)
+        mgr._index.add(self._make_meta(block_hash=b"21" * 10, numerics=None))
+        mgr._index.add(self._make_meta(block_hash=b"22" * 10, numerics=self.REVISION))
+
+        assert mgr.invalidate_stale_layer_signature() == 1
+        assert mgr._index.get(b"21" * 10) is None
+        assert mgr._index.get(b"22" * 10) is not None
+        assert mgr.signature_mismatch_reason("") is not None
+
+    def test_unaffected_models_keep_every_block(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path, None)
+        mgr._index.add(self._make_meta(block_hash=b"23" * 10, numerics=None))
+
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"23" * 10) is not None
+        assert "numerics" not in json.loads(mgr._expected_cache_signature())
+
+    def test_yarn_scaled_rotary_tags_the_revision(self):
+        language = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+        rotary = language.Qwen3_5RotaryEmbedding(8, mrope_section=[2, 1, 1])
+
+        base = numerics_revision_for_model(rotary)
+        rotary.attention_scaling = 1.25
+
+        # Toggling YaRN changes the revision, so the other blocks are swept.
+        assert numerics_revision_for_model(rotary) == f"{base},yarn-1.25"
 
 
 class TestTurboquantBitsSignature:

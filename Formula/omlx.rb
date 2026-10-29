@@ -1,10 +1,8 @@
 class Omlx < Formula
-  CUSTOM_KERNELS = %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill].freeze
-
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.0rc1.tar.gz"
-  sha256 "202f0f2187fd530a11be59ed1c4942b8a38dc1eea9428308f8b20b0e3a803d56"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.3rc1.tar.gz"
+  sha256 "288b91b956a4d6bff3dffcaf1f6ba3fd84012fe2362f7d9d4777596b801a3d7c"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -25,11 +23,10 @@ class Omlx < Formula
     skip_clean "libexec" if MacOS.version >= "27"
   end
 
-  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
-  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  # Same mlx-audio commit as pyproject.toml, installed with its [all] extras.
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+      revision: "8c244a1faff44cfa69e3151c195f52a4c1c90be5"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -47,7 +44,11 @@ class Omlx < Formula
     working_dir var
     log_path var/"log/omlx.log"
     error_log_path var/"log/omlx.log"
-    environment_variables PATH: std_service_path_env
+    # launchd KeepAlive respawns the process, so it is a supervisor in the
+    # sense /admin/api/server/restart expects: declare it so the dashboard
+    # restart button works under `brew services` instead of returning 503.
+    environment_variables PATH: std_service_path_env,
+                          OMLX_SUPERVISED: "launchd"
   end
 
   def install
@@ -84,10 +85,32 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
-      kernel_sources = CUSTOM_KERNELS.map do |kernel|
-        buildpath/"omlx/custom_kernels/#{kernel}/csrc"
+      # Execute the compiler rather than looking for it. `xcrun -f metal` only
+      # asks whether a file named `metal` is on the search path, and since Xcode
+      # 26 that file is a shim that forwards to the separately downloaded Metal
+      # toolchain. The shim is present whether or not the toolchain behind it is
+      # usable, so the lookup succeeds and the build then fails much later with
+      # an opaque CMake error in the metallib targets. Running the compiler is
+      # the only check that agrees with whether the build will work.
+      unless quiet_system("/usr/bin/xcrun", "metal", "--version")
+        odie <<~EOS
+          --with-custom-kernel requires the Metal compiler, but `xcrun metal --version` failed.
+          It ships with full Xcode, and on current Xcode versions is a separate component:
+
+            xcodebuild -downloadComponent MetalToolchain
+
+          If the component is already installed, a stale xcrun lookup cache causes this
+          same failure and is worth clearing first, because it costs nothing:
+
+            rm -f "${TMPDIR:-/tmp}/xcrun_db"
+
+          Otherwise install omlx without the custom kernels: brew install omlx
+        EOS
       end
-      unless kernel_sources.all?(&:directory?)
+
+      # Each kernel package keeps its sources in <package>/csrc; the package
+      # list comes from the tarball itself so any release layout builds.
+      unless (buildpath/"omlx/custom_kernels").glob("*/csrc").any?(&:directory?)
         odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
       end
 
@@ -110,9 +133,7 @@ class Omlx < Formula
       end
     end
 
-    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
-      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system(*pip_install, ".[all]")
     end
 
@@ -232,18 +253,19 @@ class Omlx < Formula
 
   def verify_custom_kernels(python)
     system python, "-c", <<~PYTHON
-      import importlib
-      failed = {}
-      for package in #{CUSTOM_KERNELS.inspect}:
-          fast = importlib.import_module(f"omlx.custom_kernels.{package}.fast")
-          if not fast.is_native_available():
-              failed[package] = str(fast.import_error())
-      assert not failed, failed
+      from omlx.custom_kernels import native_kernel_status
+      status = native_kernel_status()
+      failed = {name: report["import_error"] for name, report in status.items()
+                if not report["available"]}
+      assert status and not failed, failed
     PYTHON
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import pathlib, omlx_web; " \
+           "assert (pathlib.Path(omlx_web.__file__).parent / 'templates/dashboard.html').is_file()"
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
     verify_custom_kernels(libexec/"bin/python") if build.with?("custom-kernel")

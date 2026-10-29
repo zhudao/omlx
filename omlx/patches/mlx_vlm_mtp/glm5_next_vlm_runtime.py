@@ -33,7 +33,6 @@ Apply this before ``mlx_vlm.utils.load`` so the patched ``__init__`` runs.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 from omlx.utils.layer_pipeline import LayerPipeline
@@ -51,16 +50,6 @@ _APPLIED = False
 # A depth-k chain verifies k+1 rows and PoolingCache only stashes an undo
 # log for updates of 8 rows or fewer.
 _MAX_CHAIN_DEPTH = 7
-
-# Verify forwards run the attention half-layer on the vendor's exact fused
-# decode/verify kernels (HC collapse + input norm, KDA layer body with a
-# replayable capture, one-token HC expand) like plain decode does; the FFN
-# half and the sparse attention already did. OMLX_GLM5_MTP_FUSED_VERIFY=0
-# keeps the reference ops there (same values, slower).
-_FUSED_VERIFY = os.environ.get("OMLX_GLM5_MTP_FUSED_VERIFY", "1").strip() != "0"
-# Verify blocks (2..8 rows) start evaluating every _DECODE_EVAL_EVERY layers
-# while the rest of the forward is built, like one-token decode steps.
-_VERIFY_EARLY_EVAL = os.environ.get("OMLX_GLM5_MTP_VERIFY_EARLY_EVAL", "1").strip() != "0"
 
 # Source-side prefixes for the nextn MTP layer. glm5_next checkpoints use the
 # VLM-nested form; the other two are accepted so a text-only re-export or a
@@ -255,7 +244,7 @@ def _patch_linear_attention(g5_lang: Any) -> None:
     gated_delta_update = g5_lang.gated_delta_update
 
     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
-        if gdn_sink is None or (_FUSED_VERIFY and not _verify_qmm_may_route(self, inputs)):
+        if gdn_sink is None or not _verify_qmm_may_route(g5_lang, self, inputs):
             fused = self._decode_step(inputs, mask, cache, capture=gdn_sink)
             if fused is not None:
                 return fused
@@ -354,29 +343,21 @@ def _patch_linear_attention(g5_lang: Any) -> None:
     cls._omlx_mtp_capture_patched = True
 
 
-def _verify_qmm_may_route(attn: Any, inputs: mx.array) -> bool:
-    """Whether the reference KDA body's input projections may take the
-    verify-shape qmm routes (``qwen35_verify_qmm``) for this block.
+def _verify_qmm_may_route(g5_lang: Any, attn: Any, inputs: mx.array) -> bool:
+    """Whether the reference KDA body's input projections may take the armed
+    verify-shape qmm routes for this block.
 
-    The batch generator arms those routes around every MTP verify forward;
-    they take ``QuantizedLinear`` calls of 3 or more rows (2-row, depth-1
-    blocks stay unrouted). The reference body makes such calls only for a
+    The reference body makes multi-row ``QuantizedLinear`` calls only for a
     layer whose projections do not share one quantization (``_fused_in_proj``
     then runs them one by one, e.g. GLM-5.3's layer 40 with a 5-bit v_proj),
     while the fused step's grouped matmuls are never routed. Those blocks
     keep the reference body, so the verify values do not depend on the path.
+    A row-exact verify keeps the fused step, whose grouped projections then
+    run every row with its decode step's arithmetic.
     """
-    if (
-        getattr(attn, "_fused_ready", False)
-        or inputs.shape[0] * inputs.shape[1] < 3
-        or not getattr(nn.QuantizedLinear, "_omlx_verify_qmm_patched", False)
-    ):
+    if getattr(attn, "_fused_ready", False) or g5_lang._row_exact_armed():
         return False
-    try:
-        from ..qwen35_verify_qmm import _is_armed
-    except Exception:  # noqa: BLE001
-        return False
-    return bool(_is_armed())
+    return g5_lang.verify_qmm_routed(inputs.shape[0] * inputs.shape[1])
 
 
 def _patch_decoder_layer(g5_lang: Any) -> None:
@@ -390,21 +371,13 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
     def __call__(self, x, mask=None, cache=None, gdn_sink=None, defer=False):
         if gdn_sink is None:
             return original_call(self, x, mask, cache, defer=defer)
-        deferred_cls = getattr(g5_lang, "_HCDeferred", None)
-        if deferred_cls is not None and isinstance(x, deferred_cls):
+        if isinstance(x, g5_lang._HCDeferred):
             x = x.materialize()
         # Capture recurrent state only in KDA layers. Both attention families
         # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
-        fused = None
-        if _FUSED_VERIFY:
-            kernels = getattr(g5_lang, "_decode_kernels", None)
-            if kernels is not None and getattr(g5_lang, "_DECODE_FUSION", False):
-                # Settle the eager sigmoid probe outside the compiled FFN
-                # block, which cannot run it (as the vendor call does).
-                kernels.eager_sigmoid_precise(mx.float32)
-            # Same values as attn_hc + input_layernorm (None: not covered).
-            fused = g5_lang._decode_hc_pre(self.attn_hc, self.input_layernorm, x)
+        # Same values as attn_hc + input_layernorm (None: not covered).
+        fused = g5_lang._decode_hc_pre(self.attn_hc, self.input_layernorm, x)
         if fused is None:
             xc, post, comb = self.attn_hc(x)
             normed = self.input_layernorm(xc)
@@ -414,11 +387,8 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             r = self.self_attn(normed, mask, cache, gdn_sink=gdn_sink)
         else:
             r = self.self_attn(normed, mask, cache)
-        if _FUSED_VERIFY:
-            # One token: hc_expand in one exact dispatch.
-            x = g5_lang._decode_hc_expand(r, residual, post, comb)
-        else:
-            x = g5_lang.hc_expand(r, residual, post, comb)
+        # One token: hc_expand in one exact dispatch.
+        x = g5_lang._decode_hc_expand(r, residual, post, comb)
         # Reuse the stock decode compiler. Larger prefill/batch shapes stay
         # eager to avoid compiling the full MoE at unbounded token counts.
         if (
@@ -426,52 +396,25 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
-            if _FUSED_VERIFY:
-                _check_verify_router(g5_lang, self, x)
+            # One trace per row-exact mode (see Glm5NextDecoderLayer.__call__).
+            exact = g5_lang._row_exact_armed()
+            shape = (x.shape, x.dtype, exact)
+            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
+                # Kernel self-checks cannot evaluate their canaries inside a
+                # compiled trace, so each verify shape runs eagerly once.
+                self._ffn_eager_shapes.add(shape)
+                return self._ffn_block(x)
+            if exact:
+                if self._ffn_rc is None:
+                    self._ffn_rc = mx.compile(self._ffn_block)
+                return self._ffn_rc(x)
             if self._ffn_c is None:
-                # The vendor's compile keeps the layer's weights out of the
-                # trace's constants (a leaked trace would pin them in memory).
-                compile_ffn_block = getattr(g5_lang, "compile_ffn_block", None)
-                self._ffn_c = (
-                    compile_ffn_block(self, self._ffn_block)
-                    if compile_ffn_block is not None
-                    else mx.compile(self._ffn_block)
-                )
+                self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
 
     cls.__call__ = __call__
     cls._omlx_mtp_sink_patched = True
-
-
-# (block width, dtype) pairs whose fused verify router has been checked.
-_ROUTER_CHECKED: set = set()
-
-
-def _check_verify_router(g5_lang: Any, layer: Any, x: mx.array) -> None:
-    """Run the fused verify router's first-use check outside the compiled FFN.
-
-    ``decode_kernels.moe_router_rows`` compares the first call of each
-    configuration with the reference router, which takes an eager
-    evaluation; traced inside ``mx.compile`` it declines, and the compiled
-    FFN block then keeps the reference router at that width for good. One
-    eager router call per block width, on a fixed synthetic block (so it
-    neither waits for this forward nor draws random numbers), settles the
-    check first. The routes are the same either way.
-    """
-    gate = getattr(getattr(layer, "mlp", None), "gate", None)
-    width, dim = x.shape[1], x.shape[-1]
-    key = (width, x.dtype)
-    if (
-        gate is None
-        or not 2 <= width <= _MAX_CHAIN_DEPTH + 1
-        or key in _ROUTER_CHECKED
-        or not getattr(g5_lang, "_DECODE_FUSION", False)
-    ):
-        return
-    _ROUTER_CHECKED.add(key)
-    probe = mx.sin(mx.arange(width * dim, dtype=mx.float32) * 0.37) * 2.0
-    gate(probe.astype(x.dtype).reshape(1, width, dim))
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +443,7 @@ def _patch_model_call(g5_lang: Any) -> None:
 
     def __call__(self, inputs, cache=None, inputs_embeds=None,
                  return_raw_hidden: bool = False, gdn_sink=None,
-                 hidden_sink=None):
+                 hidden_sink=None, capture_layer_ids=None, capture_sink=None):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
         if cache is None:
@@ -528,18 +471,18 @@ def _patch_model_call(g5_lang: Any) -> None:
             if prefill
             else None
         )
+        # One-token steps and verify blocks (as dispatch-bound) start
+        # evaluating every few layers (scheduling only, same values).
         eval_every = (
-            getattr(g5_lang, "_DECODE_EVAL_EVERY", 0) if h.shape[1] == 1 else 0
+            g5_lang._DECODE_EVAL_EVERY if h.shape[1] <= _MAX_CHAIN_DEPTH + 1 else 0
         )
         n_layers = len(self.layers)
         # One-token decode defers each layer's last HC expand into the next
         # layer, as Glm5NextModel.__call__ does.
-        deferred_cls = getattr(g5_lang, "_HCDeferred", None)
-        defer = deferred_cls is not None and gdn_sink is None and h.shape[:2] == (1, 1)
-        if _VERIFY_EARLY_EVAL and 1 < h.shape[1] <= _MAX_CHAIN_DEPTH + 1:
-            # Verify blocks are as dispatch-bound as one-token steps: start
-            # evaluating them the same way (scheduling only, same values).
-            eval_every = getattr(g5_lang, "_DECODE_EVAL_EVERY", 0)
+        deferred_cls = g5_lang._HCDeferred
+        defer = gdn_sink is None and h.shape[:2] == (1, 1)
+        wanted = set(capture_layer_ids or ())
+        captured = {}
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -549,12 +492,22 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
                 h = layer(h, mask=mask, cache=c)
-            if pipeline is not None:
+            if i in wanted:
+                # Block drafters read a layer's output with the HC streams
+                # averaged. A deferred expand is materialized for the capture
+                # only; the next layer still consumes the deferral.
+                full = h.materialize() if isinstance(h, deferred_cls) else h
+                captured[i] = full.mean(axis=2)
+            if pipeline is not None and i in wanted:
+                pipeline.push(h, captured[i])
+            elif pipeline is not None:
                 pipeline.push(h)
             elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
                 mx.async_eval(h.arrays() if defer and isinstance(h, deferred_cls) else h)
         if pipeline is not None:
             pipeline.drain()
+        if capture_sink is not None:
+            capture_sink.extend(captured[i] for i in capture_layer_ids or ())
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary
@@ -586,7 +539,6 @@ def _patch_language_model(g5_lang: Any) -> None:
     create_attention_mask = g5_lang.create_attention_mask
 
     original_init = cls.__init__
-    original_call = cls.__call__
     original_sanitize = cls.sanitize
 
     def __init__(self, args, config=None):
@@ -595,6 +547,9 @@ def _patch_language_model(g5_lang: Any) -> None:
 
         original_init(self, args, config)
         self._omlx_mtp_multi_request = True
+        # Every speculative verify on this model, drafter blocks included,
+        # fits the PoolingCache undo log.
+        self._omlx_mtp_max_verify_rows = _MAX_CHAIN_DEPTH + 1
 
         n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
         attach_enabled = bool(is_mtp_attach_enabled())
@@ -653,11 +608,30 @@ def _patch_language_model(g5_lang: Any) -> None:
         # this path (see _patch_linear_attention). Accept and discard, as the
         # Qwen VLM runtime does.
         kwargs.pop("n_confirmed", None)
+        # Block drafter layers, returned in the requested order.
+        requested = kwargs.pop("capture_layer_ids", None)
         if inputs is None:
             inputs = kwargs.get("input_ids")
 
         if not return_hidden:
-            out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            # An ordinary decode step while a block drafter is attached keeps
+            # the committed token in the drafter context.
+            observe = (
+                requested is None
+                and scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and tuple(inputs.shape) == (len(scope), 1)
+            )
+            if observe:
+                requested = list(drafter.target_layer_ids)
+            captured = [] if requested else None
+            out = self.model(
+                inputs, cache=cache, inputs_embeds=inputs_embeds,
+                capture_layer_ids=requested, capture_sink=captured,
+            )
             if inputs_embeds is None and prompt_priming.capture_eligible(self, cache):
                 prompt_priming.maybe_capture(self, inputs, out, cache)
             nlk = kwargs.get("num_logits_to_keep", 0)
@@ -667,7 +641,10 @@ def _patch_language_model(g5_lang: Any) -> None:
                 logits = self.model.embed_tokens.as_linear(out)
             else:
                 logits = g5_lang.linear_forward(self.lm_head, out)
-            return LanguageModelOutput(logits=logits)
+            if observe:
+                drafter.observe(scope, captured)
+                return LanguageModelOutput(logits=logits)
+            return LanguageModelOutput(logits=logits, hidden_states=captured)
 
         # MTP verify forward. Returning gdn_states is what routes
         # batch_generator._call_backbone onto the mlx-vlm rollback path
@@ -675,9 +652,11 @@ def _patch_language_model(g5_lang: Any) -> None:
         # the mlx-lm path and never rewinds the KDA recurrent state.
         gdn_sink: list = []
         hidden_sink: list = []
+        captured: list = []
         out = self.model(
             inputs, cache=cache, inputs_embeds=inputs_embeds,
             gdn_sink=gdn_sink, hidden_sink=hidden_sink,
+            capture_layer_ids=requested, capture_sink=captured,
         )
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(out)
@@ -685,7 +664,7 @@ def _patch_language_model(g5_lang: Any) -> None:
             logits = g5_lang.linear_forward(self.lm_head, out)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=captured + hidden_sink,
             gdn_states=gdn_sink,
             shared_kv_states={},
         )
@@ -706,7 +685,7 @@ def _patch_language_model(g5_lang: Any) -> None:
         rebuilt, before any layer is touched.
         """
         gated_delta_update = g5_lang.gated_delta_update
-        fused_capture = getattr(g5_lang, "KdaStepCapture", ())
+        fused_capture = g5_lang.KdaStepCapture
 
         if isinstance(accepted, int):
             acc = [int(accepted)]

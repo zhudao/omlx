@@ -6,6 +6,8 @@ with directory-size-based progress polling.
 """
 
 import asyncio
+import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -17,8 +19,13 @@ from typing import Callable, Optional
 import requests
 
 from .hf_downloader import (
+    _ETA_WARMUP,
+    _ETA_WINDOW,
     DownloadStatus,
     DownloadTask,
+    _QueuePersistenceMixin,
+    _SpeedMeter,
+    _WireSpeedMeter,
     _format_model_size,
     _format_param_count,
 )
@@ -41,6 +48,8 @@ _MS_API_TIMEOUT = 15
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+_PROGRESS_POLL_INTERVAL = 0.5
 
 # Default ModelScope API base URL.
 _DEFAULT_MS_ENDPOINT = "https://modelscope.cn"
@@ -226,9 +235,8 @@ async def _fetch_model_detail_size(model_id: str) -> int:
     """Fetch a model's storage size via the detail endpoint.
 
     Used as a fallback when list_models didn't populate StorageSize.
-    Prefers ModelInfos.safetensor.model_size (weights only) and falls
-    back to the repository StorageSize (weights + tokenizer + readme).
-    Returns 0 on any error.
+    ModelInfos.safetensor.model_size is an element count, not bytes, so
+    only the repository StorageSize is used. Returns 0 on any error.
     """
     if not model_id:
         return 0
@@ -242,9 +250,7 @@ async def _fetch_model_detail_size(model_id: str) -> int:
         if resp.status_code != 200:
             return 0
         data = resp.json().get("Data") or {}
-        model_infos = data.get("ModelInfos") or {}
-        st = model_infos.get("safetensor") or {}
-        size = st.get("model_size") or data.get("StorageSize") or 0
+        size = data.get("StorageSize") or 0
         return int(size) if isinstance(size, (int, float, str)) else 0
     except (TypeError, ValueError):
         return 0
@@ -311,9 +317,8 @@ def _parse_ms_model_entry(entry: dict) -> dict:
     Returns:
         Normalized model dict matching the HF format.
     """
-    # Path is the organization/owner, Name is the model name
-    # repo_id should be "owner/model" format
-    path = entry.get("Path") or ""
+    # Path (REST) or Owner (SDK) is the organization, Name is the model
+    path = entry.get("Path") or entry.get("Owner") or ""
     name = entry.get("Name") or ""
     if path and name:
         model_id = f"{path}/{name}"
@@ -375,7 +380,30 @@ async def _fetch_ms_models_rest(
     return []
 
 
-class MSDownloader:
+class _DownloadAborted(BaseException):
+    """Stops a cancelled transfer. The SDK retries on any Exception."""
+
+
+class _AbortCallback:
+    """ModelScope progress callback that stops a cancelled transfer.
+
+    The SDK creates one per file and calls ``update()`` per chunk.
+    """
+
+    def __init__(self, should_abort: Callable[[], bool], filename: str, file_size: int):
+        self._should_abort = should_abort
+        if should_abort():
+            raise _DownloadAborted()
+
+    def update(self, size: int) -> None:
+        if self._should_abort():
+            raise _DownloadAborted()
+
+    def end(self) -> None:
+        pass
+
+
+class MSDownloader(_QueuePersistenceMixin):
     """Manages ModelScope model downloads with progress tracking.
 
     Uses modelscope.snapshot_download() for actual downloads and polls
@@ -673,6 +701,7 @@ class MSDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        tasks_file: str | Path | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
@@ -680,6 +709,7 @@ class MSDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._init_queue(tasks_file)
         self._download_sem = asyncio.Semaphore(1)
 
     @property
@@ -713,7 +743,8 @@ class MSDownloader:
             )
 
         model_id = model_id.strip()
-        if "/" not in model_id or len(model_id.split("/")) != 2:
+        parts = model_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid model ID: '{model_id}'. "
                 "Expected format: 'owner/model' (e.g., 'qwen/Qwen2.5-7B-Instruct-MLX')"
@@ -731,12 +762,14 @@ class MSDownloader:
 
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=model_id)
+        task.token = ms_token or ""
         self._tasks[task_id] = task
 
         # Start download in background
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, ms_token)
         )
+        self._persist()
 
         logger.info(f"MS Download queued: {model_id} (task_id={task_id})")
         return task
@@ -744,9 +777,8 @@ class MSDownloader:
     async def cancel_download(self, task_id: str) -> bool:
         """Cancel an active download.
 
-        Note: Due to Python threading limitations, the actual download thread
-        cannot be interrupted immediately. The download will be marked as
-        cancelled and files will be cleaned up when the thread completes.
+        The SDK thread stops at its next chunk. Partial files stay so a
+        retry can resume them.
 
         Args:
             task_id: The task ID to cancel.
@@ -765,14 +797,15 @@ class MSDownloader:
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
         task.error = "Cancellation requested. Download will stop shortly."
+        self._persist()
 
         # Stop progress polling
         progress_task = self._progress_tasks.pop(task_id, None)
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # The task stays in _active_tasks until its worker stops writing.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
@@ -797,6 +830,7 @@ class MSDownloader:
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
+        self._persist()
         return True
 
     async def retry_download(
@@ -826,13 +860,14 @@ class MSDownloader:
         model_id = old_task.repo_id
         old_retry_count = old_task.retry_count
 
-        # Remove old task entry
+        # Start fresh download (snapshot_download resumes from existing files).
+        # An empty retry token keeps the stored one. If it raises, the old
+        # row stays so the user can retry later.
+        new_task = await self.start_download(model_id, ms_token or old_task.token)
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
-
-        # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(model_id, ms_token)
         new_task.retry_count = old_retry_count + 1
+        self._persist()
         return new_task
 
     def get_tasks(self) -> list[dict]:
@@ -844,6 +879,9 @@ class MSDownloader:
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
+        # Keep persisted rows as pending/downloading so the next boot
+        # resumes them.
+        self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
             if not progress_task.done():
@@ -915,12 +953,29 @@ class MSDownloader:
                 if ms_token:
                     dl_kwargs["token"] = ms_token
 
-                # Run snapshot_download in a thread (blocking call)
-                # Note: Thread cannot be interrupted, cancellation is checked after completion
-                await asyncio.to_thread(
-                    ms_snapshot_download,
-                    **dl_kwargs,
+                # Cancel, stall and shutdown all move the task out of DOWNLOADING.
+                abort = functools.partial(
+                    _AbortCallback,
+                    lambda: task.status != DownloadStatus.DOWNLOADING,
                 )
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        ms_snapshot_download,
+                        **dl_kwargs,
+                        progress_callbacks=[abort],
+                    ),
+                )
+                try:
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    # A retry must not overlap this writer. Hold the semaphore
+                    # until the SDK thread stops, even if cancelled again.
+                    while not payload.done():
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await asyncio.wait({payload})
+                    payload.exception()  # Retrieved, so asyncio does not log it.
+                    raise
 
                 # Check if cancelled while downloading - clean up downloaded files
                 if task_id in self._cancelled:
@@ -953,6 +1008,7 @@ class MSDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
+                task.speed_bps = 0.0
                 task.downloaded_size = task.total_size or self._get_dir_size(
                     target_dir
                 )
@@ -1005,6 +1061,8 @@ class MSDownloader:
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
 
+            self._persist()
+
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
         """Poll the target directory to estimate download progress.
 
@@ -1017,16 +1075,32 @@ class MSDownloader:
 
         last_size = 0
         last_activity_at = time.time()
+        speed_meter = _SpeedMeter()
+        activity = self._get_download_activity(target_dir)
+        speed_meter.add(activity.files)
+        # Rate of the reported bytes, fed from the first moving tick to skip
+        # startup idle time.
+        eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
+        eta_started_at: float | None = None
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
-                await asyncio.sleep(2)
+                await asyncio.sleep(_PROGRESS_POLL_INTERVAL)
 
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
+                activity = self._get_download_activity(target_dir)
+                current_size = activity.logical_size
+                latest_mtime = activity.latest_mtime_ns / 1e9
                 task.downloaded_size = current_size
+                task.speed_bps = speed_meter.add(activity.files)
+                if eta_started_at is None and task.speed_bps > 0:
+                    eta_started_at = time.monotonic()
+                if eta_started_at is not None:
+                    eta_bps = eta_meter.add(task.downloaded_size)
+                    if time.monotonic() - eta_started_at >= _ETA_WARMUP:
+                        task.eta_speed_bps = eta_bps
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
@@ -1038,10 +1112,8 @@ class MSDownloader:
                 if current_size != last_size:
                     last_size = current_size
                     last_activity_at = time.time()
-                else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
-                    if latest_mtime > last_activity_at:
-                        last_activity_at = latest_mtime
+                elif latest_mtime > last_activity_at:
+                    last_activity_at = latest_mtime
 
                 # Stall detection
                 if (
@@ -1064,25 +1136,9 @@ class MSDownloader:
                     break
         except asyncio.CancelledError:
             pass
-
-    @staticmethod
-    def _get_latest_mtime(path: Path) -> float:
-        """Return the most recent modification time of any file in a directory."""
-        if not path.exists():
-            return 0.0
-        latest = 0.0
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    try:
-                        mt = f.stat().st_mtime
-                        if mt > latest:
-                            latest = mt
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return latest
+        finally:
+            task.speed_bps = 0.0
+            task.eta_speed_bps = 0.0
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

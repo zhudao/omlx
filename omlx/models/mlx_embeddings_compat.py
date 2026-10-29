@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility patches for mlx-embeddings."""
 
+import functools
 import logging
 from typing import Any
 
@@ -9,6 +10,10 @@ from ..utils.image import load_image
 logger = logging.getLogger(__name__)
 
 _QWEN3_VL_PROCESSOR_PATCHED = False
+
+_QWEN3_VL_POSIDS_PATCHED = False
+
+_SIGLIP_SINGLE_TOWER_PATCHED = False
 
 
 def _flatten_images(images: Any) -> list[Any]:
@@ -115,3 +120,88 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
 
     _QWEN3_VL_PROCESSOR_PATCHED = True
     logger.debug("Applied torch-free image loader patch for mlx-embeddings Qwen3-VL")
+
+
+def patch_qwen3_vl_position_ids_recompute() -> None:
+    """Drop the mlx-embeddings Qwen3-VL position-id cache before each forward.
+
+    mlx-embeddings caches position ids on the language model and re-slices
+    them for later requests with ``_position_ids[:, :, :seq_len]``. mlx-vlm's
+    ``get_rope_index`` now returns 2-D text position ids, so a cached value
+    can be 2-D and the 3-D re-slice fails with "Too many indices for array
+    with 2 dimensions" (jundot/omlx#3731). A cache that survives across
+    single-shot embedding requests also carries stale shapes and is mutated
+    inside ``mx.compile`` traces, which leaves a captured tracer behind for
+    the next compiled call. Recompute position ids from each request's
+    inputs instead of reusing the cache.
+    """
+    global _QWEN3_VL_POSIDS_PATCHED
+    if _QWEN3_VL_POSIDS_PATCHED:
+        return
+
+    try:
+        from mlx_embeddings.models.qwen3_vl import model as qwen3_vl_model
+    except Exception as exc:
+        logger.debug("Qwen3-VL position-ids recompute patch skipped: %s", exc)
+        _QWEN3_VL_POSIDS_PATCHED = True
+        return
+
+    original = getattr(qwen3_vl_model, "compute_qwen3_vl_hidden_states", None)
+    if original is None or getattr(original, "_omlx_patched", False):
+        _QWEN3_VL_POSIDS_PATCHED = True
+        return
+
+    @functools.wraps(original)
+    def compute_recomputing_position_ids(*args, **kwargs):
+        model = kwargs.get("model", args[0] if args else None)
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None:
+            language_model._position_ids = None
+        return original(*args, **kwargs)
+
+    compute_recomputing_position_ids._omlx_patched = True
+    qwen3_vl_model.compute_qwen3_vl_hidden_states = compute_recomputing_position_ids
+    _QWEN3_VL_POSIDS_PATCHED = True
+    logger.debug("Applied position-ids recompute patch for mlx-embeddings Qwen3-VL")
+
+
+def patch_siglip_single_tower_forward() -> None:
+    """Let the mlx-embeddings SigLIP forward embed text or images alone.
+
+    Upstream ``Model.__call__`` always runs both towers, so a call without
+    ``pixel_values`` or ``input_ids`` fails on ``None.shape``. A one-modality
+    call runs only its tower and is L2-normalized like the two-tower output.
+    The text tower runs unmasked: SigLIP pads to ``max_length`` and pools the
+    last position, and its reference tokenizers emit no attention mask.
+    """
+    global _SIGLIP_SINGLE_TOWER_PATCHED
+    if _SIGLIP_SINGLE_TOWER_PATCHED:
+        return
+
+    try:
+        from mlx_embeddings.models import siglip
+        from mlx_embeddings.models.base import ViTModelOutput, normalize_embeddings
+    except Exception as exc:
+        logger.debug("SigLIP single-tower patch skipped: %s", exc)
+        _SIGLIP_SINGLE_TOWER_PATCHED = True
+        return
+
+    original = siglip.Model.__call__
+    if getattr(original, "_omlx_patched", False):
+        _SIGLIP_SINGLE_TOWER_PATCHED = True
+        return
+
+    @functools.wraps(original)
+    def call_single_tower(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None and input_ids is not None:
+            text_embeds = self.get_text_features(input_ids=input_ids)
+            return ViTModelOutput(text_embeds=normalize_embeddings(text_embeds))
+        if input_ids is None and pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values=pixel_values)
+            return ViTModelOutput(image_embeds=normalize_embeddings(image_embeds))
+        return original(self, input_ids=input_ids, pixel_values=pixel_values, **kwargs)
+
+    call_single_tower._omlx_patched = True
+    siglip.Model.__call__ = call_single_tower
+    _SIGLIP_SINGLE_TOWER_PATCHED = True
+    logger.debug("Applied single-tower forward patch for mlx-embeddings SigLIP")

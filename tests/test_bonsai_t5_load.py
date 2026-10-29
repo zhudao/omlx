@@ -16,12 +16,13 @@ import json
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_lm.utils as mlx_lm_utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
 import omlx.patches.bonsai_t5_load as bonsai_t5_load
-from omlx.custom_kernels.bonsai.fast import _dequant_1bit
+from omlx.custom_kernels.lowbit.fast import _dequant_1bit
 from omlx.patches import bonsai_qmv
 from omlx.patches.bonsai_t5_load import (
     _is_t5_weight_replacement,
@@ -31,7 +32,7 @@ from omlx.patches.bonsai_t5_load import (
     free_t5_biases,
     remove_bonsai_t5_load_patch,
 )
-from tools.repack_ternary_t5 import pack_t5
+from scripts.repack_ternary_t5 import pack_t5
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +387,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((1, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmv", fake_qmv)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmv", fake_qmv)
         x, w, scales, biases = self._t5_inputs(M=1)
         _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called.get("fired") is True
@@ -399,7 +400,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((3, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmv_wide", fake_wide)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmv_wide", fake_wide)
         x, w, scales, biases = self._t5_inputs(M=3)
         _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called.get("fired") is True
@@ -412,7 +413,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["M"] = x_flat.shape[0]
             return mx.zeros((x_flat.shape[0], 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmm", fake_qmm)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmm", fake_qmm)
         x, w, scales, biases = self._t5_inputs(M=32)
         out = _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called["M"] == 32
@@ -426,7 +427,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((1, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_q1_affine_qmv", fake_q1)
+        monkeypatch.setattr(bonsai_t5_load, "q1_affine_qmv", fake_q1)
         x = mx.zeros((1, 64), dtype=mx.float16)
         w = mx.zeros((4, 2), dtype=mx.uint32)
         scales = mx.ones((4, 2), dtype=mx.float16)
@@ -442,7 +443,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["bits"] = bits
             return mx.zeros((3, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_qmv_wide", fake_wide)
+        monkeypatch.setattr(bonsai_t5_load, "qmv_wide", fake_wide)
         x = mx.zeros((3, 64), dtype=mx.float16)
         w = mx.zeros((4, 2), dtype=mx.uint32)
         scales = mx.ones((4, 2), dtype=mx.float16)
@@ -489,6 +490,39 @@ class TestPatchLifecycle:
             assert loaded.dtype == mx.uint8
         finally:
             remove_bonsai_t5_load_patch()
+
+    @pytest.mark.skipif(
+        not hasattr(mlx_lm_utils, "infer_quant_config"),
+        reason="mlx-lm pin predates infer_quant_config",
+    )
+    @pytest.mark.parametrize("group_size", [64, 128])
+    def test_installed_patch_reports_t5_layers_as_2bit(self, group_size):
+        """mlx-lm's width-based inference would read t5 rows as 6 bits."""
+        rng = np.random.default_rng(0)
+        q = rng.integers(0, 3, size=(4, 2 * group_size), dtype=np.uint8)
+        t5 = nn.QuantizedLinear(2 * group_size, 4, group_size=group_size, bits=2)
+        q4 = nn.QuantizedLinear(2 * group_size, 4, group_size=group_size, bits=4)
+        weights = {
+            "t5.weight": mx.array(pack_t5(q, group_size)),
+            "t5.scales": t5.scales,
+            "q4.weight": q4.weight,
+            "q4.scales": q4.scales,
+        }
+        linear = nn.Linear(2 * group_size, 4, bias=False)
+        try:
+            apply_bonsai_t5_load_patch()
+            infer = mlx_lm_utils.infer_quant_config
+            assert infer("t5", linear, weights) == {
+                "group_size": group_size,
+                "bits": 2,
+                "mode": "affine",
+            }
+            assert infer("q4", linear, weights)["bits"] == 4
+        finally:
+            remove_bonsai_t5_load_patch()
+        assert (
+            mlx_lm_utils.infer_quant_config is not bonsai_t5_load._t5_infer_quant_config
+        )
 
     def test_prefill_threshold_matches_bonsai_qmv(self):
         # The two module constants are documented as must-match.

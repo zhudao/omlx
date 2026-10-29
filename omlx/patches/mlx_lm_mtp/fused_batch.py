@@ -166,7 +166,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     ):
         # Resolve all acceptance counts and token IDs in one host transfer.
         # Stateful processors and stochastic samplers retain their row path.
-        targets = mx.argmax(logits, axis=-1).astype(mx.int32)
+        targets = bg._greedy_targets(bg._logprobs(logits))
         drafts = inputs[:, 1:].astype(mx.int32)
         matches = (targets[:, :-1] == drafts).astype(mx.int32)
         accepted = mx.cumprod(matches, axis=1).sum(axis=1, keepdims=True)
@@ -191,7 +191,6 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
         and gdn is not None
-        and not getattr(batch.model, "_omlx_mtp_commit_align", 0)
         and all(_supports_batch_rollback(layer) for layer in cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)

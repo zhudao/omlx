@@ -9,17 +9,22 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Protocol
+
+from mlx_lm import tokenizer_utils
 
 from ..utils.tokenizer import (
     create_streaming_detokenizer,
     is_gemma4_model,
     is_harmony_model,
+    is_mimo_tool_template,
 )
 from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 
@@ -345,6 +350,61 @@ class BailingHybridOutputParserSession:
         )
 
 
+def correct_tool_parser_type(parser_type: str | None, template: Any) -> str | None:
+    """Return qwen3_coder for a template that MLX template matching misreads.
+
+    MiMo renders the qwen3_coder grammar with no newline after ``<tool_call>``
+    (#4933). MLX-LM and MLX-VLM match only the newline form, so they select
+    json_tools and every call fails the native parser.
+    """
+    if parser_type == "json_tools" and is_mimo_tool_template(template):
+        return "qwen3_coder"
+    return parser_type
+
+
+def repair_tool_parser(tokenizer: Any) -> str | None:
+    """Replace a ``json_tools`` label that the chat template contradicts.
+
+    MLX-LM trusts ``tool_parser_type`` from tokenizer_config.json. Some
+    conversions store a stale ``json_tools`` label for XML grammars, so the
+    JSON parser drops every call. Only the in-memory wrapper is changed.
+    """
+    if not isinstance(tokenizer, tokenizer_utils.TokenizerWrapper):
+        return None
+    parser_module = getattr(tokenizer.tool_parser, "__module__", None)
+    if parser_module != "mlx_lm.tool_parsers.json_tools":
+        return None
+    template = tokenizer.chat_template
+    # A chat_template_type renderer does not use the Jinja template.
+    if tokenizer._chat_template is not None or not isinstance(template, str):
+        return None
+    # Resolve at call time because patches (hy_v3) rebind this function.
+    # An empty vocab keeps the choice based on the template only.
+    inferred = correct_tool_parser_type(
+        tokenizer_utils._infer_tool_parser(
+            SimpleNamespace(chat_template=template, get_vocab=dict)
+        ),
+        template,
+    )
+    if inferred in (None, "json_tools"):
+        return None
+    module = importlib.import_module(f"mlx_lm.tool_parsers.{inferred}")
+    tokenizer._tool_parser = module.parse_tool_call
+    tokenizer._tool_call_start = module.tool_call_start
+    tokenizer._tool_call_end = module.tool_call_end
+    tokenizer._tool_call_start_tokens = tuple(
+        tokenizer.encode(module.tool_call_start, add_special_tokens=False)
+    )
+    tokenizer._tool_call_end_tokens = tuple(
+        tokenizer.encode(module.tool_call_end, add_special_tokens=False)
+    )
+    logger.warning(
+        "Tool parser json_tools conflicts with the chat template; using %s",
+        inferred,
+    )
+    return inferred
+
+
 def install_minimax_m3_tokenizer_protocol(
     tokenizer: Any,
     model_name: str,
@@ -368,6 +428,7 @@ def install_minimax_m3_tokenizer_protocol(
 
     from ..patches.mlx_vlm_minimax_m3_compat import (
         apply_mlx_vlm_minimax_m3_compat_patch,
+        minimax_thinking_mode_template,
     )
 
     apply_mlx_vlm_minimax_m3_compat_patch()
@@ -422,6 +483,11 @@ def install_minimax_m3_tokenizer_protocol(
     for name in ("has_tool_calling", "has_thinking"):
         with suppress(AttributeError, TypeError):
             setattr(tokenizer, name, True)
+    # mlx_lm's TokenizerWrapper forwards this to the tokenizer it renders with.
+    with suppress(AttributeError, TypeError):
+        tokenizer.chat_template = minimax_thinking_mode_template(
+            getattr(tokenizer, "chat_template", None)
+        )
     return True
 
 
@@ -784,11 +850,12 @@ def _is_muse_glimmer_model(
     model_name: str,
     model_config: dict[str, Any] | None = None,
 ) -> bool:
+    # Muse Spark speaks the same channel protocol as Muse Glimmer.
     model_type = model_config.get("model_type") if model_config else None
-    if model_type == "muse_glimmer":
+    if model_type in ("muse_glimmer", "muse_spark"):
         return True
     lowered = model_name.lower()
-    return "muse" in lowered and "glimmer" in lowered
+    return "muse" in lowered and ("glimmer" in lowered or "spark" in lowered)
 
 
 def _append_missing_json_object_closers(payload: str) -> str | None:
@@ -1312,6 +1379,7 @@ def detect_output_parser(
     filesystem path is available so parser sessions can locate
     tokenizer.json for their streaming detokenizers.
     """
+    repair_tool_parser(tokenizer)
     session_model_path = model_path or model_name
 
     model_type = model_config.get("model_type") if model_config else None
@@ -1369,6 +1437,7 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
+            thinking_start_text="<|channel|>analysis<|message|>",
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )

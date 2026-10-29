@@ -33,6 +33,8 @@ from fastapi import (
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
+from ..engine.lfm3_speech import SPEECH_MODEL_TYPES, VOICES
+from ..engine.vlm import VLMBatchedEngine
 from ..server_metrics import get_server_metrics
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
@@ -480,7 +482,7 @@ async def create_transcription(
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
     stream: bool = Form(False),
-    max_tokens: Optional[int] = Form(None),
+    max_tokens: Optional[int] = Form(None, gt=0),
     word_timestamps: bool = Form(False),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
@@ -531,6 +533,8 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, STTEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-text model",
@@ -617,7 +621,12 @@ async def create_transcription(
     )
 
 
-def _verify_ws_api_key(api_key: Optional[str]) -> bool:
+def _lfm3_speech(engine):
+    """Return the speech service of an LFM3-Audio or LFM3-Omni engine, or None."""
+    return engine.speech if isinstance(engine, VLMBatchedEngine) else None
+
+
+def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
     """Verify an in-band API key, including the manual inference opt-in.
 
     WebSocket connections from browsers cannot carry an Authorization
@@ -632,13 +641,16 @@ def _verify_ws_api_key(api_key: Optional[str]) -> bool:
     gs = _server_state.global_settings
     if gs is not None and gs.auth.skip_api_key_verification:
         return True
-    if not api_key:
+    if not api_key or not isinstance(api_key, str):
         return False
 
-    from omlx.admin.auth import verify_any_api_key
+    from omlx.admin.auth import check_api_key, verify_any_api_key
 
     sub_keys = gs.auth.sub_keys if gs is not None else []
-    return verify_any_api_key(api_key, _server_state.api_key, sub_keys)
+    return check_api_key(
+        websocket,
+        lambda: verify_any_api_key(api_key, _server_state.api_key, sub_keys),
+    )
 
 
 @realtime_router.websocket("/v1/audio/transcriptions/realtime")
@@ -674,7 +686,12 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     if not isinstance(start, dict) or start.get("type") != "start":
         await _reject("First message must be a {'type': 'start'} object")
         return
-    if not _verify_ws_api_key(start.get("api_key")):
+    try:
+        key_ok = _verify_ws_api_key(websocket, start.get("api_key"))
+    except HTTPException as exc:
+        await _reject(str(exc.detail))
+        return
+    if not key_ok:
         await _reject("Invalid API key")
         return
     model_id = start.get("model")
@@ -823,7 +840,9 @@ async def list_model_voices(model: Optional[str] = None):
             config = {}
         talker = config.get("talker_config") or {}
         spk = talker.get("spk_id") or config.get("spk_id") or {}
-        if isinstance(spk, dict):
+        if config.get("model_type") in SPEECH_MODEL_TYPES:
+            voices = list(VOICES)
+        elif isinstance(spk, dict):
             voices = sorted(spk.keys())
     return {"model": resolved, "voices": voices}
 
@@ -892,6 +911,8 @@ async def create_speech(request: AudioSpeechRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, TTSEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
@@ -990,6 +1011,8 @@ async def process_audio(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, STSEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",

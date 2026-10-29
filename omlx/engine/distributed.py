@@ -13,6 +13,7 @@ import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,10 @@ from ..cluster.liveness import (
     marker_owner_is_live,
     read_marker,
 )
+from ..exceptions import InvalidRequestError
+from ..patches.deepseek_v41.processing import (
+    install_tokenizer_protocol as install_deepseek_v41_tokenizer_protocol,
+)
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -46,6 +51,8 @@ _request_clock = time.monotonic
 _PEER_HEALTH_TTL = 10.0
 _MAX_TARGETED_CANCEL_REQUESTS = 256
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+# Content parts the API layer keeps for an engine that accepts images.
+_MEDIA_PART_TYPES = frozenset({"image_url", "input_image", "video_url", "input_audio"})
 
 
 def _valid_transport_request_id(value: Any) -> bool:
@@ -131,6 +138,39 @@ def _reasoning_effort_retry_payloads(
     return variants
 
 
+def _with_model_mtp(
+    deployment: ClusterDeployment, model_settings: Any | None
+) -> ClusterDeployment:
+    """The deployment with the model's Lightning MTP setting applied.
+
+    The plan decides whether rank zero has room for the draft head; the model
+    settings decide whether to use it and at which depth.
+    """
+
+    execution = deployment.execution
+    wanted = bool(getattr(model_settings, "mtp_enabled", False))
+    if wanted and not execution.mtp:
+        logger.warning(
+            "Lightning MTP is enabled for %s, but its cluster plan has no room "
+            "for the draft head; activate the cluster again to use it",
+            deployment.model,
+        )
+    if not (wanted and execution.mtp):
+        if not execution.mtp:
+            return deployment
+        return replace(deployment, execution=replace(execution, mtp=False))
+    fixed = getattr(model_settings, "mtp_fixed_depth", None)
+    depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+    return replace(
+        deployment,
+        execution=replace(
+            execution,
+            mtp_depth=int(depth or 0),
+            mtp_fixed_depth=bool(fixed),
+        ),
+    )
+
+
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
@@ -185,6 +225,7 @@ class DistributedBatchedEngine(BatchedEngine):
         request_read_timeout: float | None = None,
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
+        vision_checkpoint: bool = False,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -202,6 +243,7 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
+        deployment = _with_model_mtp(deployment, model_settings)
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -226,6 +268,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_reach: tuple[float, bool] | None = None
         self._peer_health_lock = asyncio.Lock()
         self._abort_drain_timeout = float(abort_drain_timeout)
         self._orphan_reap_grace = float(orphan_reap_grace)
@@ -233,6 +276,20 @@ class DistributedBatchedEngine(BatchedEngine):
         self._next_request_seq = 0
         self._last_cancel_epoch = 0
         self._runtime_failed_reason: str | None = None
+        self._vision_checkpoint = vision_checkpoint
+
+    @property
+    def accepts_image_input(self) -> bool:
+        """Media parts reach a vision checkpoint so preflight can refuse them.
+
+        The ranks run the text model only. Dropping the parts would answer as
+        if the user sent no image.
+        """
+        return self._vision_checkpoint
+
+    @property
+    def supports_logprobs(self) -> bool:
+        return False
 
     @property
     def runtime_failed_reason(self) -> str | None:
@@ -449,6 +506,9 @@ raise SystemExit(2)
             {"trust_remote_code": self.deployment.trust_remote_code},
             config.get("eos_token_id"),
         )
+        if self._model_type == "deepseek_v41":
+            # The ranks encode with the same protocol (see inference_worker).
+            install_deepseek_v41_tokenizer_protocol(self._tokenizer, config)
 
         try:
             await asyncio.to_thread(self._supervisor.start)
@@ -479,9 +539,9 @@ raise SystemExit(2)
             for name in (
                 "dflash_enabled",
                 "specprefill_enabled",
-                "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
+                "qwen35_ane_prefill_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -491,14 +551,17 @@ raise SystemExit(2)
                 + ", ".join(incompatible)
             )
 
-    async def stop(self) -> None:
+    async def stop(self, *, local_only: bool = False) -> None:
         client, self._client = self._client, None
         try:
             if client is not None:
                 await client.aclose()
         finally:
             try:
-                await asyncio.to_thread(self._supervisor.stop)
+                await asyncio.to_thread(
+                    self._supervisor.stop,
+                    **({"local_only": True} if local_only else {}),
+                )
             finally:
                 self._tokenizer = None
                 self._model_type = None
@@ -605,6 +668,12 @@ raise SystemExit(2)
             raise ValueError("logit_bias is not yet supported by distributed inference")
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
+        if kwargs.get("no_repeat_ngram_size"):
+            # Ranks run mlx-lm's server, which has no n-gram ban.
+            raise InvalidRequestError(
+                "no_repeat_ngram_size is not supported by distributed inference",
+                field="no_repeat_ngram_size",
+            )
 
     def _completion_payload(
         self,
@@ -1901,7 +1970,53 @@ raise SystemExit(2)
         if not cached[1]:
             raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
 
-    async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
+    async def peers_reachable(self) -> bool:
+        """Does every Mac of the deployment still answer over SSH?
+
+        A dead worker group can only be torn down and relaunched while its
+        peers are reachable: ``stop()`` verifies the rank exit on every host,
+        which cannot succeed against a Mac that is off or off the network.
+        The verdict is cached for ``_PEER_HEALTH_TTL`` seconds and the probe
+        is bounded by the SSH connect timeout, so asking is cheap and safe to
+        do per request. A probe that itself fails counts as reachable, like
+        the health gate above: the teardown will then report the real error.
+        """
+
+        cached = self._peer_reach
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_reach
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(check_peers, hosts_by_rank)
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        logger.warning("peer reachability probe failed: %s", exc)
+                        reachable = True
+                    else:
+                        reachable = all(item.reachable for item in health)
+                    cached = (time.monotonic(), reachable)
+                    self._peer_reach = cached
+        return cached[1]
+
+    async def preflight_chat(
+        self, messages: list[dict[str, Any]], *args: Any, **kwargs: Any
+    ) -> None:
+        if any(
+            isinstance(part, dict) and part.get("type") in _MEDIA_PART_TYPES
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+        ):
+            raise InvalidRequestError(
+                "Image, video and audio input are not supported while this "
+                "model runs on a cluster. The cluster serves its text model "
+                "only.",
+                field="messages",
+            )
         self._validate_request_features(kwargs)
         await self._require_healthy_cluster()
         return None

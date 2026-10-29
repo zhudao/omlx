@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import base64
 import copy
+import gc
 import importlib
 import io
 import json
 import os
 import subprocess
 import sys
-import textwrap
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 import numpy as np
 import pytest
 from PIL import Image
@@ -29,6 +32,8 @@ from omlx.oq import (
 )
 from omlx.patches import mlx_vlm_glm5_next_compat as compat
 from omlx.patches.glm_moe_dsa import indexer_nax, sparse_mla, sparse_mla_nax
+from omlx.patches import qwen35_verify_qmm
+from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk
 from omlx.utils.layer_pipeline import LayerPipeline
 
 
@@ -702,9 +707,9 @@ def test_vector_gate_kernel_matches_reference_with_padding_mask():
 def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("GLM DSA native indexer extension is not built")
 
     config = _tiny_config().text_config
@@ -712,9 +717,9 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     config.index_head_dim = 128
     indexer = Glm5NextIndexer(config)
     mx.random.seed(23)
-    q = mx.random.normal((1, 5, 32, 128), dtype=mx.float16)
+    q = mx.random.normal((1, 37, 32, 128), dtype=mx.float16)
     keys = mx.random.normal((1, 7, 128), dtype=mx.float16)
-    weights = mx.random.normal((1, 5, 32), dtype=mx.float16)
+    weights = mx.random.normal((1, 37, 32), dtype=mx.float16)
     actual = indexer._native_scores(q, keys, weights)
     if actual is None:
         pytest.skip("GLM DSA indexer kernel rejected the installed ABI")
@@ -727,10 +732,10 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
 
 
 def test_glm5_next_switch_moe_uses_opt_in_native_weighted_sum():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
-    if not fast.has_symbol("glm_moe_weighted_sum"):
+    if not quant_fast.has_symbol("moe_weighted_sum"):
         pytest.skip("GLM native MoE weighted-sum extension is not built")
 
     mx.random.seed(29)
@@ -756,9 +761,9 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q4_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q4_qmm_t"):
         pytest.skip("Qwen affine prefill QMM extension is not built")
 
     base = nn.Linear(64, 64, bias=False)
@@ -767,7 +772,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 128, 64), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q4_affine_qmm_t
+    original = quant_fast.affine_q4_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -775,7 +780,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q4_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -787,9 +792,9 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q8_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q8_qmm_t"):
         pytest.skip("Qwen Q8 affine prefill QMM extension is not built")
 
     mx.random.seed(37)
@@ -799,7 +804,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 1024, 1536), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q8_affine_qmm_t
+    original = quant_fast.affine_q8_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -807,7 +812,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q8_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q8_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -820,10 +825,10 @@ def test_glm5_next_prefill_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -848,10 +853,10 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import fused_quantized_matmul
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -882,20 +887,21 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     """FP32 projections must produce FP16 inputs at native attention boundaries."""
     import mlx_vlm.models.glm5_next.language as lang
 
+    # Routing depends on the context length, not on the widths, so they stay small.
     text = lang.TextConfig(
         model_type="glm5_next_text",
         vocab_size=128,
-        hidden_size=4096,
+        hidden_size=512,
         intermediate_size=64,
         moe_intermediate_size=16,
         num_hidden_layers=2,
-        num_attention_heads=64,
-        num_key_value_heads=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
         n_shared_experts=None,
         n_routed_experts=None,
         routed_scaling_factor=1.0,
         kv_lora_rank=512,
-        q_lora_rank=1536,
+        q_lora_rank=256,
         qk_rope_head_dim=0,
         v_head_dim=256,
         qk_nope_head_dim=256,
@@ -906,7 +912,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
         rms_norm_eps=1e-5,
         index_topk=2048,
         index_head_dim=128,
-        index_n_heads=32,
+        index_n_heads=4,
         layer_types=["deepseek_sparse_attention"],
         mlp_layer_types=["dense"],
         linear_attn_config={
@@ -950,7 +956,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     # a real FP32 attention pass over 2051 rows.
     monkeypatch.setattr(attn, "_dense_prefix_rows", lambda *args: (0, 0))
 
-    x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
+    x = mx.random.normal((1, 4096, 512), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
     mx.eval(out)
     nax = [s for s in seen if s[0] == "sparse_mla_nax"]
@@ -965,7 +971,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     )
 
     seen.clear()
-    x = mx.random.normal((1, 2500, 4096), dtype=mx.float32)
+    x = mx.random.normal((1, 2500, 512), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
     mx.eval(out)
     eba = [s for s in seen if s[0] == "exact_block"]
@@ -977,10 +983,10 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
 
 def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
     """Use fused v-up only for matching dtypes and preserve FP32 scales otherwise."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -1016,10 +1022,10 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
 
 def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
     """Verify native sparse MLA output can feed an FP32-scale projection at 32K."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast as attention_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
 
-    if not fast.is_native_available():
+    if not attention_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -1414,14 +1420,15 @@ def test_kda_fused_prefill_matches_stock(monkeypatch):
     model = _kda_model(77)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
     mx.eval(reference)
     ref_conv = [cache[0] for cache in reference_cache]
     ref_state = [cache[1] for cache in reference_cache]
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -1495,18 +1502,13 @@ def test_kda_prefill_eligibility_gating(monkeypatch):
     padded.lengths = mx.array([70])
     assert not glm53_kda_prefill_eligible(layer, inputs, None, padded)
 
-    monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
-    )
-    assert not glm53_kda_prefill_eligible(layer, inputs, None, cache)
-    monkeypatch.undo()
-
     # The fused driver runs end to end and matches the module's own route.
     fused_cache = model.make_cache()[0]
     out_fused = glm53_kda_prefill(layer, inputs, fused_cache)
     stock_cache = model.make_cache()[0]
     monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
+        "omlx.patches.glm53_kda_prework.glm53_kda_prefill_eligible",
+        lambda *args: False,
     )
     out_stock = layer(inputs, None, stock_cache)
     mx.eval(out_fused, out_stock)
@@ -1531,11 +1533,12 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
     model = _kda_model(80)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -1821,38 +1824,25 @@ def test_fused_expand_is_batch_invariant():
 def test_bitwise_equal_to_canonical_path_without_tf32():
     """With MLX_ENABLE_TF32=0 the canonical prefill path runs its matmuls in
     fp32; the fused kernels then reproduce it bit for bit on this data."""
-    script = textwrap.dedent("""
-        import mlx.core as mx
-        from omlx.patches import mlx_vlm_glm5_next_compat as compat
-        compat.apply_mlx_vlm_glm5_next_compat_patch()
-        from mlx_vlm.models.deepseek_v4 import hyper_connection as dsv4_hc
-        from mlx_vlm.models.glm5_next import hc_prefill
-        from tests.test_mlx_vlm_glm5_next_compat import _hc_connection, _hc_stream
-        c = _hc_connection(cls=dsv4_hc.HyperConnection)
-        x = _hc_stream(300)
-        branch = (mx.random.normal((1, 300, 4096), key=mx.random.key(3))).astype(mx.bfloat16)
-        ref = c(x)
-        fused = hc_prefill.hc_pre(c, x)
-        ref_e = dsv4_hc.hc_expand(branch, x, ref[1], ref[2])
-        fused_e = hc_prefill.hc_expand(branch, x, fused[1], fused[2])
-        mx.eval(ref, fused, ref_e, fused_e)
-        ok = all(bool(mx.array_equal(a, b)) for a, b in zip(ref, fused))
-        ok = ok and bool(mx.array_equal(ref_e, fused_e))
-        print("BITWISE", ok)
-        """)
-    env = dict(os.environ, MLX_ENABLE_TF32="0")
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=300,
+    # MLX reads MLX_ENABLE_TF32 once per process; conftest sets it before import.
+    if os.environ.get("MLX_ENABLE_TF32") != "0":
+        pytest.skip("MLX_ENABLE_TF32 is not 0 in this session")
+    dsv4_hc, hc_prefill, _ = _hc_modules()
+    c = _hc_connection(cls=dsv4_hc.HyperConnection)
+    x = _hc_stream(300)
+    branch = (mx.random.normal((1, 300, 4096), key=mx.random.key(3))).astype(
+        mx.bfloat16
     )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert "BITWISE True" in result.stdout, result.stdout + result.stderr[-2000:]
+    ref = c(x)
+    fused = hc_prefill.hc_pre(c, x)
+    assert fused is not None
+    ref_e = dsv4_hc.hc_expand(branch, x, ref[1], ref[2])
+    fused_e = hc_prefill.hc_expand(branch, x, fused[1], fused[2])
+    assert fused_e is not None
+    mx.eval(ref, fused, ref_e, fused_e)
+    for a, b in zip(ref, fused):
+        assert mx.array_equal(a, b)
+    assert mx.array_equal(ref_e, fused_e)
 
 
 def test_unsupported_inputs_fall_back():
@@ -2190,8 +2180,9 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
 
     from omlx.patches import glm53_kda_prework as kda
 
-    enabled = kda._GLM53_KDA_PREFILL_ENABLED
-    kda._GLM53_KDA_PREFILL_ENABLED = fused
+    eligible = kda.glm53_kda_prefill_eligible
+    if not fused:
+        kda.glm53_kda_prefill_eligible = lambda *args: False
     try:
         cache = ArraysCache(size=2)
         cache[0] = conv0
@@ -2204,7 +2195,7 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
         mx.eval(out, cache[0], cache[1])
         return out, cache[0], cache[1]
     finally:
-        kda._GLM53_KDA_PREFILL_ENABLED = enabled
+        kda.glm53_kda_prefill_eligible = eligible
 
 
 def test_fused_prefill_runs_blocked_recurrence(monkeypatch):
@@ -2422,15 +2413,15 @@ def test_nax_indexer_scores_match_fp32_reference_and_mask(S, P, before):
 
 @_needs_nax_indexer
 def test_nax_indexer_scores_match_native_kernel_within_rounding():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
     S, P, before = 512, 1024, 3584
     q, k, w = _ixn_inputs(S, P, seed=1)
     pool_len = P
     out = indexer_nax.indexer_scores_nax(q, k, w, before, pool_len, 4)
-    native = fast.dsa_indexer_scores(
+    native = index_fast.dsa_indexer_scores(
         q[None].transpose(0, 2, 1, 3), k[None, None], w[None], causal=False
     )[0, 0]
     acc, valid = _ixn_reference(q, k, w, before, pool_len, 4)
@@ -2529,9 +2520,9 @@ def _require_native_scores():
     native kernel; without it that path falls back to MLX ops, which round
     the scores differently, so the exactness and near-tie bounds do not
     apply."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
 
 
@@ -2617,9 +2608,9 @@ def test_topk_differences_are_threshold_near_ties():
     scores differ only by pools whose native scores sit within one bf16 ulp
     of that row's top-k threshold (fp32 summation order at a near-tie)."""
     from mlx_vlm.models.glm5_next import language
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_topk_indices"):
+    if not index_fast.has_symbol("dsa_topk_indices"):
         pytest.skip("native top-k kernel unavailable")
     S, P, before = 512, 4096, 16384 - 512
     q, k, w = _ixn_inputs(S, P, seed=11)
@@ -2739,10 +2730,97 @@ def _smla_native(q, kv, idx, scale):
     return sparse_mla.sparse_mla_attention(q, zq, kv, zk, idx, scale)
 
 
+@pytest.mark.parametrize(
+    "L,K,topk,q_scale",
+    [(128, 4096, 2051, 1.0), (37, 700, 200, 1.0), (96, 8192, 2051, 3.0)],
+)
+def test_native_sparse_mla_matches_fp32_reference(L, K, topk, q_scale):
+    """The native 64-head prefill kernel (16-wide D staging) against fp32
+    attention over each query's selected rows."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, topk, q_scale=q_scale)
+    scale = 256**-0.5
+    out = _smla_native(q, kv, idx, scale)
+    ref = _smla_reference(q, kv, idx, scale)
+    mx.eval(out, ref)
+    assert out.shape == q.shape and out.dtype == q.dtype
+    err = mx.abs(out.astype(mx.float32) - ref)
+    # Output rounding: half a bf16 ulp of each value, plus fp32 slack.
+    assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
+
+
+@pytest.mark.parametrize(
+    "L,K,width,heads",
+    [(128, 4100, 2051, 64), (64, 2080, 2056, 64), (64, 4100, 2051, 32)],
+)
+def test_native_sparse_mla_nope_matches_zero_rope(L, K, width, heads):
+    """Zero-width rope parts (GLM-5.3's NoPE attention) select the
+    latent-only kernel: bit for bit the output of 64 zero rope dims."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, width, H=heads)
+    scale = 256**-0.5
+    rope = sparse_mla.sparse_mla_attention(
+        q,
+        mx.zeros(q.shape[:-1] + (64,), q.dtype),
+        kv,
+        mx.zeros(kv.shape[:-1] + (64,), kv.dtype),
+        idx,
+        scale,
+    )
+    nope = sparse_mla.sparse_mla_attention(
+        q,
+        mx.zeros(q.shape[:-1] + (0,), q.dtype),
+        kv,
+        mx.zeros(kv.shape[:-1] + (0,), kv.dtype),
+        idx,
+        scale,
+    )
+    assert nope is not None
+    assert _mismatches(nope, rope) == 0
+
+
+@pytest.mark.parametrize(
+    "L,K,width,pe",
+    # The 3-slot tail of GLM's 2051-slot selection; early rows whose causal
+    # limit leaves a 1..8-slot tail; real (nonzero) rope parts.
+    [(128, 4100, 2051, False), (64, 2080, 2056, False), (32, 4100, 2051, True)],
+)
+def test_native_sparse_mla_one_fragment_tail_matches_the_tile_loop(L, K, width, pe):
+    """A last key tile whose slots sit in its first fragment runs outside the
+    kernel's tile loop; padding the selection with unused slots sends the
+    same tile through the loop (masked slots), bit for bit the same output."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, width)
+    q_pe = mx.zeros(q.shape[:-1] + (64,), q.dtype)
+    k_pe = mx.zeros(kv.shape[:-1] + (64,), kv.dtype)
+    if pe:
+        q_pe = mx.random.normal(q_pe.shape).astype(q.dtype)
+        k_pe = mx.random.normal(k_pe.shape).astype(kv.dtype)
+    padded = mx.concatenate(
+        [idx, mx.full(idx.shape[:-1] + (2304 - width,), -1, dtype=idx.dtype)], axis=-1
+    )
+    scale = 256**-0.5
+    tail = sparse_mla.sparse_mla_attention(q, q_pe, kv, k_pe, idx, scale)
+    loop = sparse_mla.sparse_mla_attention(q, q_pe, kv, k_pe, padded, scale)
+    assert _mismatches(tail, loop) == 0
+
+
 @_needs_nax_sparse_mla
 @pytest.mark.parametrize(
     "L,K,topk,q_scale",
     [
+        (2, 2602, 2051, 1.0),
+        (4, 4100, 2051, 1.0),
+        (8, 8192, 2051, 3.0),
         (64, 256, 128, 1.0),
         (37, 700, 200, 1.0),
         (128, 4096, 2051, 1.0),
@@ -2802,17 +2880,6 @@ def test_nax_sparse_mla_unsupported_shapes_return_none():
 
 
 @_needs_nax_sparse_mla
-def test_nax_sparse_mla_disabled_by_env(monkeypatch):
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
-        q, kv, idx = _smla_inputs(16, 64, 32)
-        assert sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, 1.0) is None
-    finally:
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-
-
-@_needs_nax_sparse_mla
 def test_nax_sparse_mla_deterministic_across_runs():
     # Large enough to keep many threadgroups in flight; every run must be
     # bit-identical (guards against threadgroup-memory races).
@@ -2856,7 +2923,7 @@ def test_nax_sparse_mla_probabilities_keep_fp32_precision():
     assert mx.all(err <= 0.5 * ulp + 0.02).item()
 
 
-def _make_sparse_attention():
+def _make_sparse_attention(*, head_dim=16):
     from mlx.utils import tree_map
     from mlx_vlm.models import glm5_next
     from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
@@ -2876,8 +2943,8 @@ def _make_sparse_attention():
         kv_lora_rank=512,
         q_lora_rank=32,
         qk_rope_head_dim=0,
-        v_head_dim=16,
-        qk_nope_head_dim=16,
+        v_head_dim=head_dim,
+        qk_nope_head_dim=head_dim,
         num_experts_per_tok=2,
         first_k_dense_replace=99,
         max_position_embeddings=8192,
@@ -2927,13 +2994,9 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
     products, so bf16 intermediate rounding differs)."""
     attn = _make_sparse_attention()
     chunks = [2600, 1600]  # sparse at 2600 keys, then at 4200 keys
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
+    with monkeypatch.context() as off:
+        off.setattr(sparse_mla_nax, "nax_sparse_mla_available", lambda: False)
         expected = _run_attention(attn, chunks)
-    finally:
-        monkeypatch.setattr(sparse_mla_nax, "_ENABLED", True)
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
     calls = []
     orig = sparse_mla_nax.sparse_mla_attention_nax
 
@@ -2952,6 +3015,78 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
         e32, g32 = e.astype(mx.float32), g.astype(mx.float32)
         scale = mx.abs(e32).max().item()
         assert mx.abs(e32 - g32).max().item() <= tol * scale
+
+
+@_needs_nax_sparse_mla
+@pytest.mark.parametrize("length", [2, 4, 8])
+@pytest.mark.parametrize("bits", [None, 4])
+def test_nax_sparse_mla_short_verify_avoids_gather(monkeypatch, length, bits):
+    from mlx_lm.models.cache import KVCache, PoolingCache
+    from mlx_vlm.models.glm5_next import language
+
+    # This checks the existing NAX attention route independently of small scoring.
+    monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", False)
+    attn = _make_sparse_attention(head_dim=32)
+    if bits is not None:
+        nn.quantize(attn, group_size=32, bits=bits)
+    cache = [KVCache(), PoolingCache(4)]
+    mx.eval(attn(mx.random.normal((1, 2603, 64)).astype(mx.bfloat16), None, cache))
+    reference_cache = copy.deepcopy(cache)
+    x = mx.random.normal((1, length, 64)).astype(mx.bfloat16)
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn(x, None, reference_cache)
+        mx.eval(expected)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(q, kv, indices, scale):
+        output = original(q, kv, indices, scale)
+        assert output is not None
+        calls.append(q.shape[2])
+        return output
+
+    def no_gather(*args, **kwargs):
+        pytest.fail("eligible short verification used gathered SDPA")
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    monkeypatch.setattr(language, "scaled_dot_product_attention", no_gather)
+    got = attn(x, None, cache)
+    mx.eval(got)
+    assert calls == [length]
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    e32, g32 = expected.astype(mx.float32), got.astype(mx.float32)
+    assert mx.abs(e32 - g32).max().item() <= 1e-2 * mx.abs(e32).max().item()
+
+
+@pytest.mark.parametrize("batch,dtype", [(1, mx.float32), (2, mx.bfloat16)])
+def test_short_sparse_attention_preserves_unsupported_input_fallback(
+    monkeypatch, batch, dtype
+):
+    from mlx_vlm.models.glm5_next import language
+
+    q, kv, indices = _smla_inputs(4, 64, 32, dtype=dtype)
+    q, kv, indices = (mx.repeat(a, batch, axis=0) for a in (q, kv, indices))
+    attn = _make_sparse_attention()
+    attn.embed_q = attn.unembed_out = nn.Identity()
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn._gathered_attention(q, kv, indices)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(*args):
+        output = original(*args)
+        assert output is None
+        calls.append(args[0].dtype)
+        return output
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    got = attn._gathered_attention(q, kv, indices)
+    assert calls == [dtype]
+    assert got.dtype == dtype and mx.array_equal(got, expected).item()
 
 
 def _smla_realistic_inputs(L, K, H=64, dtype=mx.bfloat16, seed=0, topk_blocks=512):
@@ -3022,3 +3157,2674 @@ def test_nax_sparse_mla_deterministic_many_threadgroups():
         out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
         mx.eval(out)
         assert mx.array_equal(out, first).item()
+
+
+def _split_k_tokens(windows, before, n_pool):
+    """Tokens of the valid top-k windows, then the incomplete-window tail."""
+    w = np.array(windows)
+    n = w.shape[1] * 4
+    out = np.full((w.shape[0], n + 3), -1, np.int32)
+    for s, row in enumerate(w):
+        qpos = before + s
+        ok = (row >= 0) & (row < n_pool) & ((row + 1) * 4 - 1 <= qpos)
+        tokens = (row[:, None] * 4 + np.arange(4)).reshape(-1)
+        out[s, :n] = np.where(np.repeat(ok, 4), tokens, -1)
+        count = (qpos + 1) % 4
+        out[s, n : n + count] = qpos + 1 - count + np.arange(count)
+    return mx.array(out)[None, None]
+
+
+@_needs_nax_sparse_mla
+@pytest.mark.parametrize("width", [1, 3, 8])
+def test_split_k_decode_matches_fp32_reference(width):
+    from mlx_vlm.models.glm5_next import sparse_mla_decode as split_k
+
+    K, scale = 2603, 256**-0.5
+    before, n_pool = K - width, K // 4
+    q, kv, _ = _smla_inputs(width, K, 1, seed=width)
+    # Distinct windows, including negative, past-the-pool and incomplete ids.
+    order = mx.argsort(mx.random.uniform(shape=(width, n_pool + 8)), axis=-1)
+    windows = (order[:, :512] - 4).astype(mx.int32)
+    out = split_k.sparse_mla_decode(q, kv, windows, before, n_pool, scale)
+    ref = _smla_reference(q, kv, _split_k_tokens(windows, before, n_pool), scale)
+    err = mx.abs(out.astype(mx.float32) - ref)
+    assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
+
+    # The same row twice in a batch buffer: unpadded and left-padded.
+    pad = mx.zeros((1, 1, 5, 512), kv.dtype)
+    kv_rows = mx.concatenate(
+        [mx.concatenate([kv, pad, pad], 2), mx.concatenate([pad, kv, pad], 2)]
+    )
+    rows = mx.array([[n_pool, before, 0], [n_pool, before, 5]], mx.int32)
+    q_rows, windows_rows = mx.concatenate([q, q]), mx.stack([windows, windows])
+    batched = split_k.sparse_mla_decode_batched(
+        q_rows, kv_rows, K + 5, windows_rows, rows, scale
+    )
+    assert mx.array_equal(batched[:1], out).item()
+    assert mx.array_equal(batched[1:], out).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GPU")
+@pytest.mark.parametrize("width", [1, 8])
+def test_small_query_scores_match_fp32_reference(width):
+    from mlx_vlm.models.glm5_next import small_indexer
+
+    mx.random.seed(width)
+    before, plen = [140, 118], [37, 29]
+    q = mx.random.normal((2, width, 32, 128)).astype(mx.bfloat16)
+    keys = mx.random.normal((2, 37, 128)).astype(mx.bfloat16)
+    weights = (mx.random.normal((2, width, 32)) * 0.1).astype(mx.bfloat16)
+    batched = small_indexer.small_scores_batched(q, keys, weights, before, plen, 4)
+    for b, n in enumerate(plen):
+        got = small_indexer.small_scores(
+            q[b : b + 1], keys[b : b + 1, :n], weights[b : b + 1], before[b], 4
+        )
+        assert mx.array_equal(batched[b : b + 1, :, :n], got).item()
+        assert (batched[b, :, n:] <= -1e29).all().item()
+        ref = q[b].astype(mx.float32) @ keys[b, :n].astype(mx.float32).T
+        ref = (mx.maximum(ref, 0) * weights[b].astype(mx.float32)[..., None]).sum(1)
+        ref = ref.astype(mx.bfloat16).astype(mx.float32)
+        valid = (mx.arange(n) + 1) * 4 - 1 <= before[b] + mx.arange(width)[:, None]
+        assert mx.array_equal(got[0] <= -1e29, ~valid).item()
+        got = mx.where(valid, got[0].astype(mx.float32), 0)
+        assert mx.allclose(got, mx.where(valid, ref, 0), atol=0.02, rtol=0.01).item()
+
+
+# ---------------------------------------------------------------------------
+# Fused decode/verify kernels (bitwise against the reference op graphs)
+
+
+def _language():
+    from mlx_vlm.models.glm5_next import language
+
+    return language
+
+
+def _stats():
+    return dk.STATS
+
+
+def _bits(a: mx.array) -> mx.array:
+    view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+    return a.view(view)
+
+
+def _mismatches(a: mx.array, b: mx.array) -> int:
+    assert a.shape == b.shape and a.dtype == b.dtype
+    return int(mx.sum(_bits(a) != _bits(b)).item())
+
+
+def _rand_affine(lead, out_dims, in_dims, bits, group_size, scale=0.004):
+    """Random packed affine weights + bf16 scales/biases (valid for any bits)."""
+    words = in_dims * bits // 32
+    w = mx.random.randint(0, 2**31 - 1, (*lead, out_dims, words)).astype(mx.uint32)
+    w = w * 2 + mx.random.randint(0, 2, w.shape).astype(mx.uint32)
+    groups = in_dims // group_size
+    s = (mx.random.uniform(0.5, 1.5, (*lead, out_dims, groups)) * scale).astype(
+        mx.bfloat16
+    )
+    b = (
+        -mx.random.uniform(0.5, 1.5, (*lead, out_dims, groups)) * scale * 2**bits / 2
+    ).astype(mx.bfloat16)
+    return w, s, b
+
+
+def _quantized_linear(out_dims, in_dims, bits, group_size=64):
+    layer = nn.QuantizedLinear(64, 64, bias=False, group_size=group_size, bits=bits)
+    layer.weight, layer.scales, layer.biases = _rand_affine(
+        (), out_dims, in_dims, bits, group_size
+    )
+    return layer
+
+
+def _switch_linear(experts, out_dims, in_dims, bits, group_size=64):
+    from omlx.patches.deepseek_v4.switch_layers import QuantizedSwitchLinear
+
+    layer = QuantizedSwitchLinear(64, 64, 2, False, group_size, bits)
+    layer.weight, layer.scales, layer.biases = _rand_affine(
+        (experts,), out_dims, in_dims, bits, group_size
+    )
+    return layer
+
+
+# ---------------------------------------------------------------------------
+# Hyper-connection collapse + branch RMSNorm
+# ---------------------------------------------------------------------------
+
+
+def _hyper_connection(hidden=4096, seed=0, bf16_fn=False):
+    """``bf16_fn``: mix weights that are BF16 values, as the checkpoints'."""
+    from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection
+
+    mx.random.seed(seed)
+    cfg = SimpleNamespace(
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+        rms_norm_eps=1e-5,
+        hidden_size=hidden,
+    )
+    hc = HyperConnection(cfg)
+    hc.fn = mx.random.normal(hc.fn.shape) * 0.01
+    if bf16_fn:
+        hc.fn = hc.fn.astype(mx.bfloat16).astype(mx.float32)
+    hc.base = mx.random.normal(hc.base.shape) * 0.5
+    hc.scale = mx.random.uniform(0.5, 1.5, (3,))
+    norm = nn.RMSNorm(hidden, eps=1e-5)
+    norm.weight = mx.random.uniform(0.5, 1.5, (hidden,)).astype(mx.bfloat16)
+    hc.eval()
+    norm.eval()
+    mx.eval(hc.parameters(), norm.parameters())
+    return hc, norm
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bf16_fn", [False, True])
+@pytest.mark.parametrize("hidden", [4096, 1024])
+@pytest.mark.parametrize("length", [1, 2, 4, 8])
+def test_decode_hc_pre_is_bitwise_reference(hidden, length, bf16_fn):
+    """BF16-valued mix weights (the checkpoints') are read from their BF16
+    copy (``mix_weights``); fp32 weights from the fp32 array."""
+    language = _language()
+    hc, norm = _hyper_connection(hidden, seed=length, bf16_fn=bf16_fn)
+    assert (dk.mix_weights(hc).dtype == mx.bfloat16) == bf16_fn
+    for trial in range(3):
+        x = (mx.random.normal((1, length, 4, hidden)) * (1 + 2 * trial)).astype(
+            mx.bfloat16
+        )
+        collapsed, post, comb = hc(x)
+        reference = norm(collapsed)
+        fused = language._decode_hc_pre(hc, norm, x)
+        assert fused is not None
+        normalized, fused_post, fused_comb = fused
+        assert _mismatches(normalized, reference) == 0
+        assert _mismatches(fused_post, post) == 0
+        assert _mismatches(fused_comb, comb) == 0
+        # Each verify row equals the one-token decode of that row.
+        for row in range(length):
+            single = language._decode_hc_pre(hc, norm, x[:, row : row + 1])
+            assert _mismatches(single[0], normalized[:, row : row + 1]) == 0
+            assert _mismatches(single[2], fused_comb[:, row : row + 1]) == 0
+
+
+def _check_one_token_hc_expand(hidden):
+    """Bitwise check of the fused one-token expand; returns engaged calls."""
+    from mlx_vlm.models.deepseek_v4.hyper_connection import hc_expand
+
+    language = _language()
+    hc, norm = _hyper_connection(hidden, seed=hidden)
+    engaged = 0
+    for trial in range(8):
+        residual = (mx.random.normal((1, 1, 4, hidden)) * (1 + 2 * trial)).astype(
+            mx.bfloat16
+        )
+        _, post, comb = hc(residual)
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + trial)).astype(mx.bfloat16)
+        before = _stats()["hc_expand"]
+        fused = language._decode_hc_expand(x, residual, post, comb)
+        engaged += _stats()["hc_expand"] - before
+        reference = hc_expand(x, residual, post, comb)
+        assert _mismatches(fused, reference) == 0
+        compiled = mx.compile(lambda *a: language._decode_hc_expand(*a))(
+            x, residual, post, comb
+        )
+        assert _mismatches(compiled, reference) == 0
+    return engaged
+
+
+def _run_with_tf32(snippet: str) -> str:
+    """Run ``snippet`` with this module imported as ``t`` and MLX TF32 on.
+
+    The test session disables TF32 (conftest), which moves MLX's fp32 GEMMs
+    off the NAX units; the production default keeps them there.
+    """
+    here = Path(__file__).resolve().parent
+    code = (
+        "import sys; sys.path[:0] = [%r, %r]\n"
+        "from omlx.patches import mlx_vlm_glm5_next_compat as compat\n"
+        "compat.apply_mlx_vlm_glm5_next_compat_patch()\n"
+        "import test_mlx_vlm_glm5_next_compat as t\n"
+        "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n" % (str(here), str(here.parent))
+    ) + snippet
+    env = dict(os.environ, MLX_ENABLE_TF32="1")
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    return done.stdout
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("hidden", [4096, 1024])
+def test_one_token_hc_expand_declines_without_nax_tf32(hidden):
+    if dk.hc_comb_product() is not None:
+        pytest.skip("a kernel here replays this GPU's fp32 comb product")
+    assert _check_one_token_hc_expand(hidden) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("hidden", [4096, 1024])
+def test_one_token_hc_expand_is_bitwise_reference_on_simdgroup_mma(hidden):
+    if dk.hc_comb_product() != "simd":
+        pytest.skip("this GPU runs fp32 GEMMs on NAX")
+    assert _check_one_token_hc_expand(hidden) == 8
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_one_token_hc_expand_is_bitwise_reference_with_nax_tf32():
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if dk.nax_relaxed_fp32_matmul():\n"
+        "    for hidden in (4096, 1024):\n"
+        "        assert t._check_one_token_hc_expand(hidden) == 8\n"
+        "    print('checked')\n"
+        "else:\n"
+        "    print('no-nax')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out
+
+
+def _check_hc_deferred_chain(hidden, bf16_fn=False):
+    """Chained one-token HC pres with each expand folded into the next
+    (``_decode_hc_pre_deferred``) against the reference HyperConnection,
+    RMSNorm and hc_expand; returns the number of checked half-layers."""
+    from mlx_vlm.models.deepseek_v4.hyper_connection import hc_expand
+
+    language = _language()
+    checked = 0
+    for seed in range(6):
+        layers = [
+            _hyper_connection(hidden, seed=100 * seed + i, bf16_fn=bf16_fn)
+            for i in range(4)
+        ]
+        mx.random.seed(seed)
+        h_ref = (mx.random.normal((1, 1, 4, hidden)) * (1 + seed)).astype(mx.bfloat16)
+        x = h_ref
+        for step, (hc, norm) in enumerate(layers):
+            if seed % 2:
+                hc.base = hc.base * 10  # sharper sinkhorn / sigmoid inputs
+            assert dk.hc_defer_supported(hc, norm, mx.bfloat16, hidden)
+            collapsed, post, comb = hc(h_ref)
+            reference = norm(collapsed)
+            before = _stats()["hc_pre_fused"]
+            xn, h, f_post, f_comb, mm = language._decode_hc_pre_deferred(hc, norm, x)
+            assert _stats()["hc_pre_fused"] == before + 1
+            assert _mismatches(h, h_ref) == 0, (seed, step)
+            assert _mismatches(xn, reference) == 0, (seed, step)
+            assert _mismatches(f_post, post) == 0, (seed, step)
+            assert _mismatches(f_comb, comb) == 0, (seed, step)
+            y = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+            h_ref = hc_expand(y, h_ref, post, comb)
+            x = language._HCDeferred(y, h, f_post, f_comb, mm)
+            checked += 1
+        assert _mismatches(x.materialize(), h_ref) == 0
+    return checked
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_hc_pre_fused_rounds_the_expand_product_before_the_add():
+    """The deferred hc_pre recomputes h = bf16(f32(post * y) + mm) as the two
+    reference kernels do; on these inputs a contracted fma(post, y, mm)
+    rounds differently in many elements."""
+    hidden = 1024
+    hc, norm = _hyper_connection(hidden, seed=9)
+    if not dk.hc_defer_supported(hc, norm, mx.bfloat16, hidden):
+        pytest.skip("no fused deferred HC chain on this GPU")
+    mx.random.seed(9)
+    y = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+    post = mx.random.uniform(0.5, 2.0, (1, 1, 4))
+    product = post[0, 0, :, None] * y[0, 0][None].astype(mx.float32)
+    # mm cancels most of the product: the sum keeps its low bits.
+    mm = (-product + mx.random.normal(product.shape) * 1e-3).reshape(-1)
+    _, _, h = dk.hc_pre_fused(hc, norm, deferred=(y, mm, post))
+    reference = (product + mm.reshape(4, hidden)).astype(mx.bfloat16)
+    p64 = np.array(post[0, 0], dtype=np.float64)[:, None]
+    y64 = np.array(y[0, 0].astype(mx.float32), dtype=np.float64)[None]
+    fused = (p64 * y64 + np.array(mm, dtype=np.float64).reshape(4, hidden)).astype(
+        np.float32
+    )
+    contracted = mx.array(fused).astype(mx.bfloat16)
+    assert _mismatches(contracted, reference) > 20
+    assert _mismatches(h.reshape(4, hidden), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_hc_deferred_chain_declines_without_nax_tf32():
+    if dk.hc_comb_product() is not None:
+        pytest.skip("a kernel here replays this GPU's fp32 comb product")
+    hc, norm = _hyper_connection(1024)
+    assert not dk.hc_defer_supported(hc, norm, mx.bfloat16, 1024)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bf16_fn", [False, True])
+@pytest.mark.parametrize("hidden", [4096, 1024, 2048])
+def test_hc_deferred_chain_is_bitwise_reference_on_simdgroup_mma(hidden, bf16_fn):
+    if dk.hc_comb_product() != "simd":
+        pytest.skip("this GPU runs fp32 GEMMs on NAX")
+    assert _check_hc_deferred_chain(hidden, bf16_fn) == 24
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_hc_deferred_chain_is_bitwise_reference_with_nax_tf32():
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "if dk.nax_relaxed_fp32_matmul():\n"
+        "    for hidden in (4096, 1024, 2048):\n"
+        "        assert t._check_hc_deferred_chain(hidden) == 24\n"
+        "    print('checked')\n"
+        "else:\n"
+        "    print('no-nax')\n"
+    )
+    if "no-nax" in out:
+        pytest.skip("this GPU runs fp32 GEMMs without NAX")
+    assert "checked" in out
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_hc_defer_declines_uncovered_connections():
+    hc, norm = _hyper_connection(1024)
+    assert not dk.hc_defer_supported(hc, norm, mx.float32, 1024)
+    hc3, norm3 = _hyper_connection(768)
+    assert not dk.hc_defer_supported(hc3, norm3, mx.bfloat16, 768)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_decode_hc_pre_declines_uncovered_inputs():
+    language = _language()
+    hc, norm = _hyper_connection(1024)
+    assert (
+        language._decode_hc_pre(hc, norm, mx.zeros((2, 1, 4, 1024), mx.bfloat16))
+        is None
+    )
+    assert (
+        language._decode_hc_pre(hc, norm, mx.zeros((1, 9, 4, 1024), mx.bfloat16))
+        is None
+    )
+    hc.train()
+    assert (
+        language._decode_hc_pre(hc, norm, mx.zeros((1, 1, 4, 1024), mx.bfloat16))
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# MoE experts
+# ---------------------------------------------------------------------------
+
+
+def _moe(
+    experts=16,
+    hidden=1024,
+    inter=512,
+    top_k=8,
+    shared_bits=8,
+    seed=0,
+    routed_bits=4,
+    down_bits=None,
+):
+    language = _language()
+    mx.random.seed(seed)
+    cfg = SimpleNamespace(
+        hidden_size=hidden,
+        moe_intermediate_size=inter,
+        n_routed_experts=experts,
+        swiglu_limit=10.0,
+        num_experts_per_tok=top_k,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        n_shared_experts=1 if shared_bits else None,
+        intermediate_size=4 * hidden,
+    )
+    moe = language.Glm5NextMoE(cfg)
+    sw = moe.switch_mlp
+    sw.gate_proj = _switch_linear(experts, inter, hidden, routed_bits)
+    sw.up_proj = _switch_linear(experts, inter, hidden, routed_bits)
+    sw.down_proj = _switch_linear(experts, hidden, inter, down_bits or routed_bits)
+    if shared_bits:
+        sh = moe.shared_experts
+        sh.gate_proj = _quantized_linear(inter, hidden, shared_bits)
+        sh.up_proj = _quantized_linear(inter, hidden, shared_bits)
+        sh.down_proj = _quantized_linear(hidden, inter, shared_bits)
+    moe.gate.weight = mx.random.normal((experts, hidden)) * 0.02
+    moe.gate.e_score_correction_bias = mx.random.normal((experts,)) * 0.01
+    moe.eval()
+    mx.eval(moe.parameters())
+    return moe
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(("routed_bits", "down_bits"), [(4, 4), (3, 4)])
+@pytest.mark.parametrize("shared_bits", [8, 4, 0])
+@pytest.mark.parametrize("length", [1, 2, 4, 7])
+def test_decode_experts_are_bitwise_reference(
+    length, shared_bits, routed_bits, down_bits, monkeypatch
+):
+    language = _language()
+    moe = _moe(
+        shared_bits=shared_bits,
+        seed=length,
+        routed_bits=routed_bits,
+        down_bits=down_bits,
+    )
+    for trial in range(2):
+        x = (mx.random.normal((1, length, 1024)) * (0.5 + trial)).astype(mx.bfloat16)
+        indices, scores = moe.gate(x)
+        wide_before = _stats()["moe_shared_wide"]
+        down_before = _stats()["moe_down_shared_wide"]
+        fused = moe._decode_experts(x, indices, scores)
+        assert fused is not None
+        wide_used = _stats()["moe_shared_wide"] - wide_before
+        assert wide_used == (1 if shared_bits and length > 1 else 0)
+        assert _stats()["moe_down_shared_wide"] - down_before == wide_used
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = moe(x)
+        compiled = mx.compile(moe)(x) if length == 1 else reference
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused, reference) == 0
+        assert _mismatches(fused, compiled) == 0
+        assert _mismatches(moe(x), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 2, 3, 4])
+def test_decode_experts_all_3bit_cover_unsorted_routes(length, monkeypatch):
+    """All-3-bit experts: below the sort threshold (32 routes) the fused
+    kernels replay the unsorted gather; from there SwitchGLU sorts the routes
+    for its native block kernels and the fused path steps aside."""
+    language = _language()
+    moe = _moe(shared_bits=8, seed=21 + length, routed_bits=3, down_bits=3)
+    x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    fused = moe._decode_experts(x, indices, scores)
+    if indices.size >= 32:
+        assert fused is None
+        return
+    assert fused is not None
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 3])
+def test_decode_experts_with_3bit_shared_expert_are_bitwise_reference(
+    length, monkeypatch
+):
+    """3-bit shared expert: one token runs it in the fused kernels; for
+    several rows its qmv_wide products keep the reference calls."""
+    language = _language()
+    moe = _moe(shared_bits=3, seed=11 + length, routed_bits=3, down_bits=4)
+    x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    wide_before = _stats()["moe_shared_wide"]
+    fused = moe._decode_experts(x, indices, scores)
+    assert fused is not None
+    assert _stats()["moe_shared_wide"] == wide_before
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    assert _mismatches(fused, reference) == 0
+
+
+class _OffloadedExperts(nn.Module):
+    """Stands in for expert offload's SwitchGLU wrapper: routed experts
+    behind the module, no gate/up/down projections on it."""
+
+    def __init__(self, glu):
+        super().__init__()
+        self.glu = glu
+
+    def __call__(self, x, indices, **kwargs):
+        return self.glu(x, indices, **kwargs)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 3])
+def test_decode_moe_declines_offloaded_experts(length, monkeypatch):
+    language = _language()
+    moe = _moe(seed=3)
+    x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    moe.switch_mlp = _OffloadedExperts(moe.switch_mlp)
+    assert moe._decode_select(x) is None
+    indices, scores = moe.gate(x)
+    assert moe._decode_experts(x, indices, scores) is None
+    assert _mismatches(moe(x), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "out_dims,in_dims",
+    # gemv's 4- and 8-simdgroup tiles; the split-K tile of K >= 16 N (the
+    # indexer pool gate), with a partial last K block and a shifted tail
+    # tile; a partial K block and a shifted tail on the 8-simdgroup tile.
+    [(1536, 4096), (8192, 4096), (128, 4096), (38, 1536), (4102, 1000)],
+)
+def test_rows_gemv_rows_match_their_one_row_gemv(out_dims, in_dims):
+    """A multi-row float matmul (gemv_wide or a GEMM tile) sums in another
+    order than the one-row gemv; rows_gemv gives each row the latter."""
+    w = (
+        mx.random.normal((out_dims, in_dims), key=mx.random.key(out_dims)) * 0.05
+    ).astype(mx.bfloat16)
+    for rows in (2, 5, 8):
+        x = (
+            mx.random.normal((1, rows, in_dims), key=mx.random.key(rows)) * 0.7
+        ).astype(mx.bfloat16)
+        out = dk.rows_gemv(x, w)
+        reference = mx.concatenate([x[:, r : r + 1] @ w.T for r in range(rows)], axis=1)
+        assert out.shape == reference.shape
+        assert _mismatches(out, reference) == 0, rows
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("rows,masked", [(1, False), (4, False), (3, True)])
+def test_dsa_attention_rows_match_the_gather_and_sdpa_fallback(rows, masked):
+    """Each row equals its decode step's dsa_gather_selected + SDPA fallback
+    (steel GEMM scores, precise softmax, split-K PV) over 2051 selected
+    rows, unused slots and masked keys included."""
+    if not dk.dsa_attention_rows_supported(64, 512, 2051, mx.bfloat16):
+        pytest.skip("NAX GPUs run other attention GEMMs")
+    kv_len, width = 4500, 2051
+    kv = (mx.random.normal((kv_len, 512), key=mx.random.key(rows)) * 2).astype(
+        mx.bfloat16
+    )
+    q = (mx.random.normal((rows, 64, 512), key=mx.random.key(10 + rows)) * 3).astype(
+        mx.bfloat16
+    )
+    lens = [kv_len - rows + r + 1 for r in range(rows)]
+    perm = mx.random.permutation(kv_len - rows, key=mx.random.key(20 + rows))[
+        : width - 5
+    ]
+    idx = mx.concatenate([perm, mx.full((5,), -1)]).astype(mx.int32)
+    idx = mx.broadcast_to(idx, (rows, width))
+    keep = mx.random.uniform(key=mx.random.key(30 + rows), shape=(rows, kv_len)) > 0.1
+    valid = None
+    if masked:
+        clamped = mx.minimum(mx.maximum(idx, 0), mx.array(lens)[:, None] - 1)
+        valid = (idx >= 0) & mx.take_along_axis(keep, clamped, axis=-1)
+    out = dk.dsa_attention_rows(
+        q, kv, idx, mx.array(lens, dtype=mx.int32), 192**-0.5, valid
+    )
+    for r in range(rows):
+        g, sel = dk.dsa_gather_selected(kv[None, None, : lens[r]], idx[r][None, None])
+        if masked:
+            sel = valid[r][None, None, None]
+        reference = mx.fast.scaled_dot_product_attention(
+            q[r][None, :, None], g, g, scale=192**-0.5, mask=sel
+        )
+        assert _mismatches(out[r], reference[0, :, 0]) == 0, r
+
+
+def _row_exact_block(model, block, cache):
+    """``model(block)`` as a row-exact MTP verify forward runs it."""
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        logits = model(block, cache=cache).logits
+        mx.eval(logits)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    return logits
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("batch_cache", [False, True])
+@pytest.mark.parametrize(
+    "prompt_len,width",
+    # Dense attention; a block whose first rows stay at or below index_topk
+    # (their decode steps skip selection); sparse selection, with 8 rows x
+    # top-8 routes reaching SwitchGLU's sort threshold.
+    [(300, 5), (2045, 4), (2101, 2), (2101, 8)],
+)
+def test_row_exact_verify_rows_match_their_decode_steps(prompt_len, width, batch_cache):
+    """Also on a one-row batch cache (the server's layout): its decode steps
+    take the masked one-token path."""
+    _check_row_exact_verify(prompt_len, width, batch_cache)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("batch_cache", [False, True])
+@pytest.mark.parametrize("prompt_len,width", [(300, 5), (2101, 8)])
+def test_row_exact_verify_rows_of_the_fp8_checkpoint_match_their_decode_steps(
+    prompt_len, width, batch_cache
+):
+    """BF16 projections (multi-row: gemv_wide or GEMM tiles; the KDA input
+    bank and gate projections, the indexer, lm_head) beside MXFP8 MLPs,
+    experts and MLA projections."""
+    _check_row_exact_verify(prompt_len, width, batch_cache, fp8_checkpoint=True)
+
+
+def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    if sparse_mla_nax.nax_sparse_mla_available():
+        pytest.skip("row-exact verify runs only without NAX")
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    decoded = _fused_shape_model(51, **model_kwargs)
+    verified = _fused_shape_model(51, **model_kwargs)
+    # A disarmed forward of the block's width (a short prefill chunk) compiles
+    # its FFN first; the verify must not reuse that trace.
+    short = mx.random.randint(0, 256, (1, width), key=mx.random.key(5)).astype(mx.int32)
+    for _ in range(2):
+        mx.eval(verified(short, cache=verified.make_cache()).logits)
+    prompt = mx.random.randint(0, 256, (1, prompt_len), key=mx.random.key(7)).astype(
+        mx.int32
+    )
+    caches = []
+    for model in (decoded, verified):
+        cache = model.make_cache()
+        for start in range(0, prompt_len, 512):
+            mx.eval(model(prompt[:, start : start + 512], cache=cache).logits)
+        caches.append(bg._merge_row_caches([cache]) if batch_cache else cache)
+    fused_rows = _stats()["dsa_rows_attention"]
+    for block_index in range(2):
+        block = mx.random.randint(
+            0, 256, (1, width), key=mx.random.key(11 + block_index)
+        ).astype(mx.int32)
+        steps = [
+            decoded(block[:, r : r + 1], cache=caches[0]).logits for r in range(width)
+        ]
+        rows = _row_exact_block(verified, block, caches[1])
+        mx.eval(steps)
+        for r, step in enumerate(steps):
+            assert _mismatches(rows[:, r : r + 1], step) == 0, (block_index, r)
+    # Blocks whose rows all select run their attention in one fused call;
+    # none select below index_topk.
+    fused = _stats()["dsa_rows_attention"] > fused_rows
+    if prompt_len > 2048:
+        assert fused == dk.dsa_attention_rows_supported(16, 512, 2051, mx.bfloat16)
+    elif prompt_len + 2 * width <= 2048:
+        assert not fused
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("width", [2, 8])
+def test_row_exact_verify_kda_rows_with_mixed_projection_bits(width):
+    """A row-exact verify block of a mixed-quantization KDA layer (GLM-5.3's
+    layer 40) runs its grouped projections with one-row arithmetic: every
+    row and the final states equal the serial decode steps'."""
+    layer = _kda_layer(seed=33, v_bits=5)
+    decoded, verified = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    for cache in (decoded, verified):
+        mx.eval(layer(prompt, cache=cache))
+    x = (mx.random.normal((1, width, 1024)) * 0.7).astype(mx.bfloat16)
+    steps = [layer(x[:, r : r + 1], cache=decoded) for r in range(width)]
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        rows = layer(x, cache=verified)
+        mx.eval(rows, verified.cache)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    mx.eval(steps, decoded.cache)
+    for r, step in enumerate(steps):
+        assert _mismatches(rows[:, r : r + 1], step) == 0, r
+    assert _mismatches(verified[0], decoded[0]) == 0
+    assert _mismatches(verified[1], decoded[1]) == 0
+    assert not layer._fused_ready and layer._rows_in_proj
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_linear_declines_armed_verify_routes():
+    """Armed MTP verify routes replace the reference multi-row qmm, which the
+    fused projections replay, so multi-row blocks keep the reference call."""
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    language = _language()
+    x = (mx.random.normal((1, 3, 1024)) * 0.7).astype(mx.bfloat16)
+    layers = [_quantized_linear(256, 1024, 8), _quantized_linear(128, 1024, 8)]
+    assert language._multi_linear(x, layers) is not None
+    for row_exact in (False, True):
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=row_exact)
+        try:
+            assert language._multi_linear(x, layers) is None
+            assert language._multi_linear(x[:, :1], layers) is not None
+        finally:
+            qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("routed_bits", [4, 3])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_one_token_moe_selects_routes_inside_gate_up(seed, routed_bits, monkeypatch):
+    """One token: the gate/up kernel replays the router's top-k selection
+    (router logits -> gate/up -> down), bitwise like the reference MoE,
+    including exact score ties."""
+    language = _language()
+    moe = _moe(
+        experts=288,
+        hidden=4096,
+        inter=2048,
+        shared_bits=8,
+        seed=seed,
+        routed_bits=routed_bits,
+        down_bits=4,
+    )
+    if seed == 2:
+        weight = moe.gate.weight
+        bias = moe.gate.e_score_correction_bias
+        for e in (7, 70, 140, 280):  # exact duplicates of expert 200
+            weight[e] = weight[200]
+            bias[e] = bias[200]
+        moe.gate.weight, moe.gate.e_score_correction_bias = weight, bias
+    for trial in range(4):
+        x = (mx.random.normal((1, 1, 4096)) * (0.3 + trial)).astype(mx.bfloat16)
+        before = _stats()["router_select_fused"]
+        fused = moe(x)
+        assert _stats()["router_select_fused"] == before + 1
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = moe(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bits", [8, 4, 3])
+def test_one_token_dense_mlp_gate_up_is_bitwise_reference(bits, monkeypatch):
+    """GLM-5.3's dense MLP layers: gate/up + clamped SwiGLU in one dispatch
+    for one token, bitwise like the eager and the compiled reference."""
+    language = _language()
+    cfg = SimpleNamespace(hidden_size=1024, intermediate_size=2048, swiglu_limit=10.0)
+    mlp = language.Glm5NextMLP(cfg)
+    mlp.gate_proj = _quantized_linear(2048, 1024, bits)
+    mlp.up_proj = _quantized_linear(2048, 1024, bits)
+    mlp.down_proj = _quantized_linear(1024, 2048, bits)
+    mlp.eval()
+    mx.eval(mlp.parameters())
+    for trial in range(4):
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + 3 * trial)).astype(mx.bfloat16)
+        before = _stats()["mlp_gate_up"]
+        fused = mlp(x)
+        assert _stats()["mlp_gate_up"] == before + 1
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = mlp(x)
+        compiled = mx.compile(mlp)(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused, reference) == 0
+        assert _mismatches(fused, compiled) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bits", [8, 5, 4, 6])
+@pytest.mark.parametrize("n_k", [(512, 256), (256, 512), (128, 1024)])
+def test_one_token_mla_head_qmv_is_bitwise_reference(bits, n_k):
+    """embed_q / unembed_out (QuantizedMultiLinear, 64 heads) for one token."""
+    from mlx_lm.models.mla import MultiLinear
+
+    N, K = n_k
+    for gs in (64, 32):
+        mx.random.seed(bits * 31 + N + gs)
+        layer = MultiLinear(K, N, 64)
+        layer.weight = (mx.random.normal(layer.weight.shape) * 0.05).astype(mx.bfloat16)
+        layer = layer.to_quantized(gs, bits)
+        for trial in range(3):
+            x = (mx.random.normal((1, 64, 1, K)) * (1 + 2 * trial)).astype(mx.bfloat16)
+            reference = layer(x)
+            for nsg in (2, 8):
+                fused = dk.mla_head_qmv(x, layer, nsg=nsg)
+                assert fused is not None
+                assert _mismatches(fused, reference) == 0, (gs, trial, nsg)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_mla_head_qmv_declines_qmv_quad_shapes():
+    from mlx_lm.models.mla import MultiLinear
+
+    layer = MultiLinear(128, 512, 8).to_quantized(64, 8)
+    assert dk.mla_head_qmv(mx.zeros((1, 8, 1, 128), mx.bfloat16), layer) is None
+    layer = MultiLinear(256, 512, 8).to_quantized(64, 8)
+    assert dk.mla_head_qmv(mx.zeros((1, 8, 2, 256), mx.bfloat16), layer) is None
+    assert (
+        dk.mla_head_qmv(mx.zeros((1, 8, 1, 256), mx.bfloat16), MultiLinear(256, 512, 8))
+        is None
+    )
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_pool_compress_matches_the_composed_window_softmax(dtype):
+    """The indexer's pool compress in one kernel against the op graph it
+    replaces (gate + ape, the composed softmax over each window, the
+    weighted sum): one window (a decode step), a prefill chunk, a partial
+    window left over, two sequences, and large logits."""
+    mx.random.seed(7)
+    for batch, rows, scale in (
+        (1, 4, 1.0),
+        (1, 2048, 3.0),
+        (1, 10, 20.0),
+        (2, 12, 1.0),
+    ):
+        keys = (mx.random.normal((batch, rows, 128)) * scale).astype(dtype)
+        gate = (mx.random.normal((batch, rows, 128)) * scale).astype(dtype)
+        ape = (mx.random.normal((4, 128)) * 0.5).astype(dtype)
+        usable = rows // 4 * 4
+        k = keys[:, :usable].reshape(batch, -1, 4, 128)
+        g = gate[:, :usable].reshape(batch, -1, 4, 128)
+        probs = mx.softmax(g + ape[None, None], axis=2)
+        reference = mx.sum(probs * k, axis=2)
+        got = dk.pool_compress(keys, gate, ape)
+        assert got is not None and got.shape == reference.shape
+        assert _mismatches(got, reference) == 0, (batch, rows, scale)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("kv_len", [1, 300, 4099])
+@pytest.mark.parametrize("width", [1, 7, 2051])
+def test_dsa_gather_selected_is_bitwise_reference(kv_len, width):
+    """The one-token sparse attention's clipped take_along_axis and mask."""
+    mx.random.seed(kv_len + width)
+    cache = (mx.random.normal((1, 1, kv_len + 64, 512)) * 3).astype(mx.bfloat16)
+    kv = cache[:, :, :kv_len, :]
+    idx = mx.random.randint(-3, kv_len + 3, (1, 1, 1, width)).astype(mx.int32)
+    idx = mx.where(idx >= kv_len, -1, idx)
+    clamped = mx.clip(idx[:, :, 0, :], 0, kv_len - 1)[..., None]
+    reference = mx.take_along_axis(
+        kv, mx.broadcast_to(clamped, clamped.shape[:-1] + (512,)), axis=2
+    )
+    reference_mask = (idx >= 0)[:, :, 0, :][:, :, None, :]
+    out, valid = dk.dsa_gather_selected(kv, idx[:, :, 0, :])
+    assert _mismatches(out, reference) == 0
+    assert valid.dtype == mx.bool_ and valid.shape == reference_mask.shape
+    assert mx.array_equal(valid, reference_mask).item()
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("heads", [16, 64])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_dsa_decode_attention_matches_gather_and_sdpa_fallback(heads, dtype):
+    """One token's attention over its selected rows (the scores kernel with
+    the gather, scaled queries and mask folded in, softmax, P x V) against
+    dsa_gather_selected + SDPA (its unfused fallback): bitwise, with unused
+    (-1) and repeated rows, short selections and short caches."""
+    if not dk.dsa_decode_attention_supported(heads, 512, dtype):
+        pytest.skip("NAX GPUs keep the gather + SDPA fallback")
+    scale = 256**-0.5
+    for kv_len, width in ((300, 2), (300, 7), (2100, 2051), (4099, 2051), (9000, 2051)):
+        mx.random.seed(kv_len + width + heads)
+        kv = (mx.random.normal((1, 1, kv_len, 512)) * 2).astype(dtype)
+        idx = mx.random.randint(-3, kv_len, (1, 1, width)).astype(mx.int32)
+        idx = mx.where(idx < 0, -1, idx)
+        q = (mx.random.normal((1, heads, 1, 512)) * 3).astype(dtype)
+        g, valid = dk.dsa_gather_selected(kv, idx)
+        reference = mx.fast.scaled_dot_product_attention(
+            q, g, g, scale=scale, mask=valid
+        )
+        got = dk.dsa_decode_attention(q, kv, idx, scale)
+        assert got is not None and got.shape == reference.shape
+        assert _mismatches(got, reference) == 0, (kv_len, width)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
+    moe = _moe()
+    x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted
+    indices, scores = moe.gate(x)
+    assert moe._decode_experts(x, indices, scores) is None
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_decode_experts_compile_inside_ffn_graph(monkeypatch):
+    language = _language()
+    moe = _moe(seed=5)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    fused = mx.compile(moe)(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    assert _mismatches(fused, reference) == 0
+
+
+# ---------------------------------------------------------------------------
+# DSA indexer decode scores and selection
+# ---------------------------------------------------------------------------
+
+
+def _indexer(hidden=256, seed=0):
+    language = _language()
+    mx.random.seed(seed)
+    cfg = SimpleNamespace(
+        hidden_size=hidden,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+        index_kpool_always_select_tail=True,
+        q_lora_rank=128,
+    )
+    indexer = language.Glm5NextIndexer(cfg)
+    indexer.index_kpool_compress_ape = mx.random.normal((4, 128)) * 0.1
+    indexer.index_kpool_compress_gate = mx.random.normal((128, hidden)) * 0.05
+    indexer.set_dtype(mx.bfloat16)
+    indexer.eval()
+    mx.eval(indexer.parameters())
+    return indexer
+
+
+def _native_indexer_available():
+    from omlx.custom_kernels.sparse_index import fast as index_fast
+
+    return index_fast.has_symbol("dsa_indexer_scores") and index_fast.has_symbol("dsa_topk_indices")
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 2, 4, 5, 8])
+def test_dsa_decode_scores_match_native_steel_tile(length):
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    indexer = _indexer(seed=length)
+    for pool in (513, 1024, 1090):
+        q = mx.random.normal((1, length, 32, 128)).astype(mx.bfloat16)
+        keys = (mx.random.normal((1, pool, 128)) * 0.7).astype(mx.bfloat16)
+        weights = (mx.random.normal((1, length, 32)) * 0.1).astype(mx.bfloat16)
+        pool_len = pool - 2
+        first = pool_len * 4 - length + 1
+        reference = indexer._native_scores(q, keys, weights)
+        idx = mx.arange(pool)
+        query_pos = first + mx.arange(length)
+        valid = (idx[None, None] < pool_len) & (
+            ((idx + 1) * 4 - 1)[None, None] <= query_pos[None, :, None]
+        )
+        reference = mx.where(valid, reference, -1e30)
+        scores = dk.dsa_decode_scores(q, keys, weights, first, pool_len, 4)
+        assert _mismatches(scores, reference) == 0
+
+
+def _make_pool_caches():
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+
+    apply_pooling_cache_support()
+    from mlx_lm.models.cache import KVCache, PoolingCache
+
+    return PoolingCache(4), KVCache()
+
+
+def _expand_reference(
+    selected, first, pool_len, left_padding, kpool, tail_width, width
+):
+    """Glm5NextIndexer.__call__'s expansion of selected pool rows [1, L, K]
+    (one sequence, rows at positions first, first + 1, ...)."""
+    _, rows, _ = selected.shape
+    selected = selected.astype(mx.int32)
+    query_pos = first + mx.arange(rows)[None]
+    valid = (selected < pool_len) & ((selected + 1) * kpool - 1 <= query_pos[..., None])
+    tokens = selected[..., None] * kpool + mx.arange(kpool) + left_padding
+    topk = mx.where(valid[..., None], tokens, -1).reshape(1, rows, -1)
+    tail_count = (query_pos + 1) % kpool
+    offsets = mx.arange(tail_width)
+    tail = query_pos[..., None] + 1 - tail_count[..., None] + offsets + left_padding
+    tail = mx.where(offsets < tail_count[..., None], tail, -1)
+    topk = mx.concatenate([topk, tail], axis=-1)
+    pad = mx.full((1, rows, width - topk.shape[-1]), -1, dtype=topk.dtype)
+    return mx.concatenate([topk, pad], axis=-1)[:, None]
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("pool", [512, 1025, 1026, 1500, 2048, 2049, 5000, 66000])
+def test_dsa_select_topk_matches_native_topk_expanded(pool):
+    """Decode/verify indexer selection (radix select and index expansion in
+    one kernel) against the native radix-select kernel followed by the
+    general path's expansion: same token indices in the same order, with
+    exact score ties, -1e30 masked blocks, a NaN, FP16 scores, left padding
+    and partial tail windows."""
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    from omlx.custom_kernels.sparse_index import fast as index_fast
+
+    for rows in (1, 4, 8):
+        for trial in range(5):
+            mx.random.seed(pool + 10 * rows + trial)
+            s = mx.random.normal((1, rows, pool))
+            if trial == 1:
+                s = mx.round(s * 4) / 4
+            if trial == 2:
+                s = mx.where(mx.random.uniform(shape=s.shape) < 0.3, -1e30, s)
+            s = s.astype(mx.float16 if trial == 4 else mx.bfloat16)
+            if trial == 3:
+                s = s.at[0, 0, 7].add(float("nan"))
+            pool_len = pool - trial % 2
+            first = pool_len * 4 - rows + trial
+            padding = mx.array([trial % 3], dtype=mx.int32)
+            selected = index_fast.dsa_topk_indices(s[:, None], 512)[:, 0]
+            expected = _expand_reference(selected, first, pool_len, padding, 4, 3, 2051)
+            got = dk.dsa_select_topk(s, 512, first, pool_len, padding, 4, 3, 2051)
+            assert got is not None and got.dtype == mx.int32
+            assert mx.array_equal(got, expected).item(), (rows, trial)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("native_topk", [True, False])
+def test_indexer_fast_selection_matches_general_path(monkeypatch, native_topk):
+    """Where the general path scores decode rows with the NAX indexer, the
+    fast selection takes the same scores."""
+    if native_topk and not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    if not native_topk:
+        from omlx.custom_kernels.sparse_index import fast as index_fast
+
+        has_symbol = index_fast.has_symbol
+        monkeypatch.setattr(
+            index_fast,
+            "has_symbol",
+            lambda name: name != "dsa_topk_indices" and has_symbol(name),
+        )
+
+    language = _language()
+    nax_calls = []
+    real_nax = language.indexer_scores_nax
+    monkeypatch.setattr(
+        language,
+        "indexer_scores_nax",
+        lambda *args: nax_calls.append(args[0].shape[0]) or real_nax(*args),
+    )
+    indexer = _indexer(seed=11)
+    hidden = 256
+    mx.random.seed(12)
+    prompt = (mx.random.normal((1, 2105, hidden)) * 0.5).astype(mx.bfloat16)
+    qr_prompt = (mx.random.normal((1, 2105, 128)) * 0.5).astype(mx.bfloat16)
+    pools = []
+    for _ in range(2):
+        pool, kv = _make_pool_caches()
+        for start in range(0, 2105, 512):
+            indexer.fast_decode = False
+            out = indexer(
+                prompt[:, start : start + 512],
+                qr_prompt[:, start : start + 512],
+                None,
+                cache=pool,
+                kv_cache=kv,
+            )
+            if out is not None:
+                mx.eval(out)
+        pools.append((pool, kv))
+    (fast_pool, fast_kv), (ref_pool, ref_kv) = pools
+    for step, width in enumerate([1, 1, 3, 1, 4, 8, 1, 2]):
+        x = (mx.random.normal((1, width, hidden)) * 0.5).astype(mx.bfloat16)
+        qr = (mx.random.normal((1, width, 128)) * 0.5).astype(mx.bfloat16)
+        indexer.fast_decode = True
+        calls = len(nax_calls)
+        fast = indexer(x, qr, None, cache=fast_pool, kv_cache=fast_kv)
+        assert len(nax_calls) - calls == int(indexer_nax.nax_indexer_available())
+        indexer.fast_decode = False
+        reference = indexer(x, qr, None, cache=ref_pool, kv_cache=ref_kv)
+        assert fast is not None and reference is not None
+        assert fast.shape == reference.shape
+        assert fast.dtype == reference.dtype
+        assert int(mx.sum(fast != reference).item()) == 0, f"step {step} width {width}"
+
+
+# ---------------------------------------------------------------------------
+# End to end: a small quantized GLM-5.3 whose shapes engage every fused path
+# ---------------------------------------------------------------------------
+
+
+def _fused_shape_model(seed, heads=16, quantize_mla=False, fp8_checkpoint=False):
+    """``fp8_checkpoint``: the FP8 checkpoint's layout instead of oQ's. mlx-vlm
+    requantizes its block-FP8 tensors (MLPs and experts, MLA q_a/q_b/kv_a and
+    o_proj) to MXFP8 at load and the engine fuses the experts' gate/up; the
+    KDA, indexer, kv_b and lm_head weights stay BF16."""
+    from mlx_lm.models.mla import MultiLinear
+    from mlx_vlm.models import glm5_next
+
+    from omlx.patches.deepseek_v4.switch_layers import SwitchLinear
+    from omlx.patches.moe_gate_up_fusion import apply_switch_glu_gate_up_fusion
+
+    quantized = (nn.Linear, SwitchLinear) + ((MultiLinear,) if quantize_mla else ())
+
+    language = _language()
+    text = glm5_next.TextConfig(
+        model_type="glm5_next_text",
+        vocab_size=256,
+        hidden_size=1024,
+        intermediate_size=2048,
+        moe_intermediate_size=512,
+        num_hidden_layers=4,
+        num_attention_heads=heads,
+        num_key_value_heads=heads,
+        n_shared_experts=1,
+        n_routed_experts=128,
+        routed_scaling_factor=2.5,
+        kv_lora_rank=512,
+        q_lora_rank=256,
+        qk_rope_head_dim=0,
+        v_head_dim=64,
+        qk_nope_head_dim=64,
+        num_experts_per_tok=8,
+        first_k_dense_replace=1,
+        max_position_embeddings=8192,
+        rms_norm_eps=1e-5,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=32,
+        layer_types=[
+            "linear_attention",
+            "deepseek_sparse_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+        ],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+        linear_attn_config={
+            "num_heads": 8,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+        },
+        index_kpool=4,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+    )
+    mx.random.seed(seed)
+    model = language.LanguageModel(text)
+
+    def block_fp8(path, m):
+        parts = path.split(".")
+        mla = parts[-1] in (
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "o_proj",
+        ) and (text.layer_types[int(parts[2])] == "deepseek_sparse_attention")
+        return isinstance(m, (nn.Linear, SwitchLinear)) and (".mlp." in path or mla)
+
+    if fp8_checkpoint:
+        nn.quantize(
+            model, group_size=32, bits=8, mode="mxfp8", class_predicate=block_fp8
+        )
+    else:
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda _, m: isinstance(m, quantized),
+        )
+    params = []
+    for name, value in nn.utils.tree_flatten(model.parameters()):
+        if value.dtype in (mx.uint32, mx.uint8):
+            continue
+        if language.glm5_next_cast_predicate(name):
+            value = (mx.random.normal(value.shape) * 0.05).astype(mx.bfloat16)
+            if name.endswith("scales"):
+                value = mx.abs(value) * 0.1 + 0.002
+            if "norm" in name and name.endswith("weight"):
+                value = (1.0 + value).astype(mx.bfloat16)
+        else:
+            value = mx.random.normal(value.shape) * 0.05
+            if name.endswith("hc.scale") or name.endswith("hc.base"):
+                value = value * 10
+        params.append((name, value))
+    model.load_weights(params, strict=False)
+    if fp8_checkpoint:
+        assert apply_switch_glu_gate_up_fusion(model) == 3
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+def _check_small_model(seed=41, prompt_len=2101, heads=16, quantize_mla=False):
+    """Fused vs reference logits of a small model, bitwise; returns families used.
+
+    Prompts beyond index_topk (2048) run the sparse DSA paths, shorter ones
+    the dense latent attention.
+    """
+    language = _language()
+    fused_model = _fused_shape_model(seed, heads, quantize_mla)
+    reference_model = _fused_shape_model(seed, heads, quantize_mla)
+    prompt = mx.random.randint(0, 256, (1, prompt_len)).astype(mx.int32)
+    caches = []
+    for model in (fused_model, reference_model):
+        cache = model.make_cache()
+        for start in range(0, prompt.shape[1], 512):
+            logits = model(prompt[:, start : start + 512], cache=cache).logits
+            mx.eval(logits)
+        caches.append(cache)
+    fused_cache, reference_cache = caches
+    next_ids = mx.argmax(logits[:, -1:], axis=-1).astype(mx.int32)
+    before = dict(_stats())
+    saved = language._DECODE_FUSION
+    try:
+        for step, width in enumerate([1, 1, 4, 1, 7, 2, 1, 8, 3, 4, 8]):
+            block = mx.concatenate(
+                [next_ids, (next_ids + mx.arange(1, width)[None]) % 256], axis=1
+            )[:, :width]
+            language._DECODE_FUSION = True
+            fused = fused_model(block, cache=fused_cache).logits
+            mx.eval(fused)
+            language._DECODE_FUSION = False
+            reference = reference_model(block, cache=reference_cache).logits
+            mx.eval(reference)
+            assert mx.all(mx.isfinite(reference)).item()
+            assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+            next_ids = mx.argmax(reference[:, -1:], axis=-1).astype(mx.int32)
+    finally:
+        language._DECODE_FUSION = saved
+    return {k for k, v in _stats().items() if v > before.get(k, 0)}
+
+
+_CORE_FUSED = {"hc_mix", "kda", "moe_gate_up", "moe_down"}
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_small_model_decode_and_verify_logits_are_bitwise_reference(monkeypatch):
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    # Retain bitwise assertions for the original scorer and attention kernels.
+    monkeypatch.setattr(_language(), "_SMALL_QUERY_INDEXER", False)
+    used = _check_small_model()
+    attention = "dsa_gather" if dk.is_nax_available() else "dsa_decode_attention"
+    assert _CORE_FUSED | {attention} <= used, used
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_small_model_dense_attention_is_bitwise_reference():
+    used = _check_small_model(seed=43, prompt_len=300)
+    assert _CORE_FUSED <= used, used
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_small_model_quantized_mla_is_bitwise_reference():
+    """Quantized MLA projections (as in the checkpoint): unembed_out (K =
+    kv_lora_rank) runs mla_head_qmv for one token; logits stay bitwise."""
+    used = _check_small_model(seed=47, prompt_len=300, quantize_mla=True)
+    assert "mla_head_qmv" in used, used
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_small_model_bitwise_reference_with_nax_tf32():
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    out = _run_with_tf32(
+        "print(sorted(t._check_small_model() | t._check_small_model(43, 300)))\n"
+    )
+    used = set(eval(out.strip().splitlines()[-1]))
+    assert _CORE_FUSED <= used, used
+    for family in ("hc_expand", "hc_pre_fused", "hc_post_mm"):
+        if family in used:
+            continue
+        # Only acceptable where MLX itself would not use NAX relaxed fp32.
+        assert (
+            not _run_with_tf32(
+                "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+                "print(dk.nax_relaxed_fp32_matmul())\n"
+            )
+            .strip()
+            .endswith("True")
+        )
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
+    """The MTP runtime's replacement model loop and KDA layer call (plain
+    decode) keep the fused paths, HC expands folded into the next layer
+    included, bit for bit."""
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    out = _run_with_tf32(
+        "from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime as rt\n"
+        "assert rt.apply()\n"
+        "from mlx_vlm.models.glm5_next import language as g5\n"
+        "assert g5.Glm5NextModel._omlx_mtp_call_patched\n"
+        "assert g5.Glm5NextLinearAttention._omlx_mtp_capture_patched\n"
+        "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
+        "used = t._check_small_model(43, 300) | t._check_small_model()\n"
+        "print(dk.hc_comb_product() is not None, sorted(used))\n"
+    )
+    last = out.strip().splitlines()[-1]
+    assert "'kda'" in last and "'hc_mix'" in last, last
+    if last.startswith("True"):
+        assert "'hc_pre_fused'" in last and "'hc_post_mm'" in last, last
+
+
+# ---------------------------------------------------------------------------
+# KDA linear attention layer body
+# ---------------------------------------------------------------------------
+
+
+def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0, v_bits=8, float_proj=False):
+    """``float_proj``: BF16 projections (the FP8 checkpoint's KDA layers)."""
+    from mlx_vlm.models import glm5_next
+
+    language = _language()
+    mx.random.seed(seed)
+
+    def proj(out_dims, in_dims, bits):
+        if not float_proj:
+            return _quantized_linear(out_dims, in_dims, bits)
+        layer = nn.Linear(in_dims, out_dims, bias=False)
+        layer.weight = mx.random.uniform(-0.3, 0.3, (out_dims, in_dims)).astype(
+            mx.bfloat16
+        )
+        return layer
+
+    config = SimpleNamespace(
+        hidden_size=hidden,
+        linear_num_heads=heads,
+        linear_head_dim=128,
+        linear_conv_kernel_dim=4,
+        linear_lower_bound=-5.0,
+        rms_norm_eps=1e-5,
+    )
+    layer = language.Glm5NextLinearAttention(config)
+    qkv = heads * 128
+    for name, (out_dims, in_dims) in {
+        "q_proj": (qkv, hidden),
+        "k_proj": (qkv, hidden),
+        "v_proj": (qkv, hidden),
+        "g_a_proj": (128, hidden),
+        "b_proj": (heads, hidden),
+    }.items():
+        bits = v_bits if name == "v_proj" else 8
+        setattr(layer, name, proj(out_dims, in_dims, bits))
+    fg = layer.forget_gate
+    fg.f_a_proj = proj(128, hidden, 8)
+    fg.f_b_proj = proj(qkv, 128, gate_bits)
+    layer.g_b_proj = proj(qkv, 128, gate_bits)
+    fg.A_log = mx.random.normal((heads,)) * 0.5
+    fg.dt_bias = mx.random.normal((qkv,)) * 0.5
+    layer.conv1d.weight = (mx.random.normal((3 * qkv, 4, 1)) * 0.5).astype(mx.bfloat16)
+    layer.o_norm.weight = mx.random.uniform(0.5, 1.5, (128,)).astype(mx.bfloat16)
+    layer.o_proj = nn.Identity()  # compare the o_proj input directly
+    layer.eval()
+    mx.eval(layer.parameters())
+    del glm5_next
+    return layer
+
+
+def _arrays_cache():
+    from mlx_vlm.models.cache import ArraysCache
+
+    return ArraysCache(size=2)
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="needs Metal allocation accounting"
+)
+def test_kda_affine_fusion_does_not_retain_a_second_weight_bank():
+    """After lazy fusion, the six public projections share the fused bank."""
+    layer = _kda_layer()
+    x = mx.zeros((1, 1, 1024), dtype=mx.bfloat16)
+    mx.eval(x)
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    del out
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    # Metal rounds buffers larger than one VM page up to a whole page. The
+    # fused metadata banks can need padding even when their sources did not,
+    # and how much of it shows up depends on earlier allocations, so the
+    # padding is only an upper bound. A second bank would add sum(sizes).
+    page = os.sysconf("SC_PAGE_SIZE")
+    sizes = [layer[name].nbytes for name in ("_fw", "_fs", "_fb")]
+    padding = sum((-size) % page if size > page else 0 for size in sizes)
+    assert padding < sum(sizes)
+    assert mx.get_active_memory() - before <= padding
+    # Dropping and rebuilding the bank keeps the public projections usable.
+    for name in ("_fw", "_fs", "_fb"):
+        del layer[name]
+    layer._fused_ready = False
+    layer._decode_groups = None
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    del out
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    assert mx.get_active_memory() - before <= padding
+
+
+@pytest.mark.parametrize("promoted_field", ["scales", "biases"])
+def test_kda_shared_bank_keeps_mixed_metadata_dtypes(promoted_field):
+    layer = _kda_layer()
+    mods = [
+        layer.q_proj,
+        layer.k_proj,
+        layer.v_proj,
+        layer.forget_gate.f_a_proj,
+        layer.g_a_proj,
+        layer.b_proj,
+    ]
+    for m in mods:
+        m.scales = m.scales.astype(mx.bfloat16)
+        m.biases = m.biases.astype(mx.bfloat16)
+    layer.q_proj[promoted_field] = layer.q_proj[promoted_field].astype(mx.float32)
+    x = mx.random.normal((1, 4, 1024)).astype(mx.bfloat16)
+    before_outputs = [m(x) for m in mods]
+    mx.eval(before_outputs)
+    before = [
+        {
+            k: (m[k].dtype, m[k].shape, np.array(m[k].view(mx.uint8)).tobytes())
+            for k in ("weight", "scales", "biases")
+        }
+        for m in mods
+    ]
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    for m, saved in zip(mods, before):
+        for field, (dtype, shape, data) in saved.items():
+            assert m[field].dtype == dtype
+            assert m[field].shape == shape
+            assert np.array(m[field].view(mx.uint8)).tobytes() == data
+    for m, expected in zip(mods, before_outputs):
+        actual = m(x)
+        mx.eval(actual)
+        assert actual.dtype == expected.dtype
+        assert (
+            np.array(actual.view(mx.uint8)).tobytes()
+            == np.array(expected.view(mx.uint8)).tobytes()
+        )
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+def test_kda_affine_shared_weights_preserve_projections_and_serialization(
+    bits, dtype, tmp_path
+):
+
+    def host(a):
+        return np.array(a.astype(mx.float32) if a.dtype == mx.bfloat16 else a)
+
+    layer = _kda_layer()
+    mods = [
+        layer.q_proj,
+        layer.k_proj,
+        layer.v_proj,
+        layer.forget_gate.f_a_proj,
+        layer.g_a_proj,
+        layer.b_proj,
+    ]
+    for m in mods:
+        w = mx.random.normal((m.weight.shape[0], 1024)).astype(dtype)
+        m.weight, m.scales, m.biases = mx.quantize(w, group_size=64, bits=bits)
+        m.bits, m.group_size = bits, 64
+    mx.eval(layer.parameters())
+    # Host snapshots do not keep the original device buffers alive.
+    original = [{k: host(m[k]) for k in ("weight", "scales", "biases")} for m in mods]
+    parameters = {
+        k: np.array(v.view(mx.uint8)).tobytes()
+        for k, v in tree_flatten(layer.parameters())
+    }
+    parameter_meta = {
+        k: (v.shape, v.dtype) for k, v in tree_flatten(layer.parameters())
+    }
+    x = mx.random.normal((2, 256, 1024)).astype(dtype)
+    mx.eval(x)
+    for rows in (1, 4, 256):
+        out = layer._fused_in_proj(x[:, :rows])
+        mx.eval(out)
+        # The shared bank must give the fused result of an unshared bank.
+        reference = mx.split(
+            _language().fused_quantized_matmul(
+                x[:, :rows],
+                *[
+                    mx.concatenate(
+                        [
+                            mx.array(saved[k]).astype(m[k].dtype)
+                            for m, saved in zip(mods, original)
+                        ],
+                        axis=0,
+                    )
+                    for k in ("weight", "scales", "biases")
+                ],
+                bits=bits,
+                group_size=64,
+            ),
+            layer._split_pts,
+            axis=-1,
+        )
+        mx.eval(reference)
+        for fused, expected in zip(out, reference):
+            assert (
+                np.array(fused.view(mx.uint8)).tobytes()
+                == np.array(expected.view(mx.uint8)).tobytes()
+            )
+        for m, saved in zip(mods, original):
+            for field, expected in saved.items():
+                actual = host(m[field])
+                assert actual.dtype == expected.dtype
+                assert actual.tobytes() == expected.tobytes()
+            old = mx.quantized_matmul(
+                x[:, :rows],
+                *[
+                    mx.array(saved[k]).astype(m[k].dtype)
+                    for k in ("weight", "scales", "biases")
+                ],
+                transpose=True,
+                bits=bits,
+                group_size=64,
+            )
+            new = m(x[:, :rows])
+            mx.eval(old, new)
+            assert (
+                np.array(old.view(mx.uint8)).tobytes()
+                == np.array(new.view(mx.uint8)).tobytes()
+            )
+
+    for key, value in tree_flatten(layer.parameters()):
+        assert key in parameters
+        assert (value.shape, value.dtype) == parameter_meta[key]
+        assert np.array(value.view(mx.uint8)).tobytes() == parameters[key]
+    path = tmp_path / "layer.safetensors"
+    layer.save_weights(str(path))
+    saved_parameters = mx.load(str(path))
+    assert set(saved_parameters) == set(parameters)
+    for key, value in saved_parameters.items():
+        assert (value.shape, value.dtype) == parameter_meta[key]
+        assert np.array(value.view(mx.uint8)).tobytes() == parameters[key]
+    # Rebuilding the bank must leave the public projections intact.
+    layer._fused_ready = False
+    out = layer._fused_in_proj(x[:, :1])
+    mx.eval(out)
+    for m, saved in zip(mods, original):
+        assert np.array(m.weight).tobytes() == saved["weight"].tobytes()
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "gate_bits,float_proj",
+    # float: the FP8 checkpoint's BF16 projections (a float bank matmul, the
+    # gate projections outside the kernel).
+    [(8, False), (5, False), (8, True)],
+)
+def test_kda_decode_step_is_bitwise_reference(gate_bits, float_proj, monkeypatch):
+    language = _language()
+    layer = _kda_layer(
+        gate_bits=gate_bits, seed=gate_bits + float_proj, float_proj=float_proj
+    )
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    for cache in (fused_cache, reference_cache):
+        mx.eval(layer(prompt, cache=cache))
+    for step, width in enumerate([1, 1, 3, 8, 2, 1]):
+        x = (mx.random.normal((1, width, 1024)) * (0.5 + step % 3)).astype(mx.bfloat16)
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = layer(x, cache=reference_cache)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        before = _stats()["kda"]
+        fused = layer(x, cache=fused_cache)
+        assert _stats()["kda"] == before + 1
+        mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
+        assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+        assert _mismatches(fused_cache[0], reference_cache[0]) == 0
+        assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_glm_sigmoid_reproduces_eager_and_compiled_mx_sigmoid():
+    compiled = mx.compile(mx.sigmoid)
+    for dtype in (mx.bfloat16, mx.float16, mx.float32):
+        x = (mx.random.normal((4096,)) * 6).astype(dtype)
+        kernel = mx.fast.metal_kernel(
+            name="glm5_sigmoid_check",
+            input_names=["x"],
+            output_names=["out"],
+            header=dk._QMV_HEADER,
+            source="out[thread_position_in_grid.x] = glm_sigmoid<T>(x[thread_position_in_grid.x]);",
+        )
+        (out,) = kernel(
+            inputs=[x],
+            template=[("T", dtype)],
+            grid=(x.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[dtype],
+        )
+        assert _mismatches(out, mx.sigmoid(x)) == 0, dtype
+        assert _mismatches(out, compiled(x)) == 0, dtype
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("gate_bits", [8, 5])
+@pytest.mark.parametrize("seed", [20, 24, 28])
+def test_kda_decode_step_seed_sweep_is_bitwise_reference(seed, gate_bits, monkeypatch):
+    """The reference's beta and output-gate sigmoids are eager mx.sigmoid
+    kernels; several of these seeds differed in a few outputs (and then in
+    the recurrent state) when the kernel's exp did not match MLX's Sigmoid."""
+    language = _language()
+    layer = _kda_layer(seed=seed, gate_bits=gate_bits)
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    for cache in (fused_cache, reference_cache):
+        mx.eval(layer(prompt, cache=cache))
+    for step, width in enumerate([1, 1, 4, 1, 8, 1, 1, 2, 1, 1]):
+        x = (mx.random.normal((1, width, 1024)) * (0.5 + step % 3)).astype(mx.bfloat16)
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = layer(x, cache=reference_cache)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        gate5 = _stats()["kda_gate5"]
+        fused = layer(x, cache=fused_cache)
+        # 5-bit gate rows are replayed in the kernel for one token only.
+        assert _stats()["kda_gate5"] - gate5 == int(gate_bits == 5 and width == 1)
+        mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
+        assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+        assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("v_bits", [5, 4])
+def test_kda_decode_step_with_mixed_projection_bits(v_bits, monkeypatch):
+    """GLM-5.3 layer 40 quantizes v_proj to 5 bits and q/k/gates to 8: the
+    decode path runs one projection matmul per quantization instead of the
+    reference layer body."""
+    language = _language()
+    layer = _kda_layer(seed=20 + v_bits, v_bits=v_bits)
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    for cache in (fused_cache, reference_cache):
+        mx.eval(layer(prompt, cache=cache))
+    for step, width in enumerate([1, 1, 4, 1, 8]):
+        x = (mx.random.normal((1, width, 1024)) * (0.5 + step % 3)).astype(mx.bfloat16)
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        reference = layer(x, cache=reference_cache)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        before = _stats()["kda"]
+        fused = layer(x, cache=fused_cache)
+        assert _stats()["kda"] == before + 1
+        mx.eval(reference, fused, fused_cache.cache, reference_cache.cache)
+        assert _mismatches(fused, reference) == 0, f"step {step} width {width}"
+        assert _mismatches(fused_cache[0], reference_cache[0]) == 0
+        assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+    assert not layer._fused_ready and layer._decode_groups
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("width", [1, 4])
+def test_kda_decode_step_from_empty_cache(width, monkeypatch):
+    language = _language()
+    layer = _kda_layer(seed=30 + width)
+    x = (mx.random.normal((1, width, 1024)) * 0.7).astype(mx.bfloat16)
+    fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
+    before = _stats()["kda"]
+    fused = layer(x, cache=fused_cache)
+    assert _stats()["kda"] == before + 1
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = layer(x, cache=reference_cache)
+    mx.eval(fused, reference)
+    assert _mismatches(fused, reference) == 0
+    assert _mismatches(fused_cache[0], reference_cache[0]) == 0
+    assert _mismatches(fused_cache[1], reference_cache[1]) == 0
+
+
+# ---------------------------------------------------------------------------
+# MoE router (one token)
+# ---------------------------------------------------------------------------
+
+
+def _router(experts=288, hidden=4096, seed=0):
+    language = _language()
+    mx.random.seed(seed)
+    cfg = SimpleNamespace(
+        num_experts_per_tok=8,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        n_routed_experts=experts,
+        hidden_size=hidden,
+    )
+    gate = language.Glm5NextMoEGate(cfg)
+    gate.weight = mx.random.normal((experts, hidden)) * 0.02
+    gate.e_score_correction_bias = mx.random.normal((experts,)) * 0.01
+    return gate
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "experts,hidden,bias", [(288, 4096, 0.0), (288, 4096, 14.0), (64, 512, 0.0)]
+)
+def test_router_is_bitwise_reference(experts, hidden, bias, monkeypatch):
+    """One-token router vs group_expert_select, bitwise over many draws.
+
+    The reference takes the sigmoid with MLX's eager kernel (precise exp on
+    release wheels, where a runtime-compiled exp differs in the last bit for
+    a few percent of logits and so, after normalization, in ~5% of routes);
+    ``bias`` 14 is the checkpoint's e_score_correction_bias level.
+    """
+    language = _language()
+    gate = _router(experts, hidden, seed=experts)
+    gate.e_score_correction_bias = gate.e_score_correction_bias + bias
+    for trial in range(96):
+        x = (mx.random.normal((1, 1, hidden)) * (0.3 + trial % 6)).astype(mx.bfloat16)
+        before = _stats()["router"]
+        indices, scores = gate(x)
+        assert _stats()["router"] == before + 1
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        ref_indices, ref_scores = gate(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert indices.dtype == ref_indices.dtype and indices.shape == ref_indices.shape
+        assert mx.array_equal(indices, ref_indices).item()
+        assert _mismatches(scores, ref_scores) == 0, trial
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_router_breaks_exact_ties_like_argpartition(monkeypatch):
+    language = _language()
+    gate = _router(seed=3)
+    weight = gate.weight
+    bias = gate.e_score_correction_bias
+    # Experts 7, 70, 140 and 280 become exact duplicates of expert 200.
+    for e in (7, 70, 140, 280):
+        weight[e] = weight[200]
+        bias[e] = bias[200]
+    bias[200] = bias[200] + 1.0  # push the tied group into the top-k
+    for e in (7, 70, 140, 280):
+        bias[e] = bias[200]
+    gate.weight, gate.e_score_correction_bias = weight, bias
+    x = mx.random.normal((1, 1, 4096)).astype(mx.bfloat16)
+    indices, scores = gate(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    ref_indices, ref_scores = gate(x)
+    tied = [int(i) for i in ref_indices[0, 0].tolist() if i in (7, 70, 140, 200, 280)]
+    assert tied == sorted(tied) and len(tied) == 5
+    assert mx.array_equal(indices, ref_indices).item()
+    assert _mismatches(scores, ref_scores) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_router_orders_nan_scores_like_argpartition(monkeypatch):
+    language = _language()
+    gate = _router(64, 512, seed=9)
+    bias = gate.e_score_correction_bias
+    for e in range(64):
+        if e not in (5, 33, 60):
+            bias[e] = float("nan")
+    gate.e_score_correction_bias = bias
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    before = _stats()["router"]
+    indices, scores = gate(x)
+    assert _stats()["router"] == before + 1
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    ref_indices, ref_scores = gate(x)
+    assert sorted(ref_indices[0, 0].tolist()[:3]) == [5, 33, 60]
+    assert mx.array_equal(indices, ref_indices).item()
+    assert _mismatches(scores, ref_scores) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_router_declines_other_gemv_configurations():
+    # K >= 16 * E selects MLX's split-K (bn=8) gemv, which is not replicated.
+    x = mx.zeros((1, 1024), mx.bfloat16)
+    assert dk.moe_router(x, mx.zeros((16, 1024)), mx.zeros((16,)), 8, 2.5, True) is None
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+def test_router_reads_bf16_valued_weights_from_a_bf16_copy(monkeypatch):
+    """Router weights holding BF16 values (both GLM-5.3 checkpoints) are read
+    from an exact BF16 copy: the decode and verify routes and scores of the
+    fp32 read and of the reference graph. Other weights stay fp32, and a
+    reassigned weight is checked again."""
+    language = _language()
+    gate = _router(seed=5)
+    assert dk.router_weights(gate).dtype == mx.float32
+    gate.weight = gate.weight.astype(mx.bfloat16).astype(mx.float32)
+    assert dk.router_weights(gate).dtype == mx.bfloat16
+    for rows in (1, 3):
+        x = mx.random.normal((1, rows, 4096)).astype(mx.bfloat16)
+        indices, scores = gate(x)
+        fp32 = dk.moe_router(
+            x.reshape(rows, -1),
+            gate.weight,
+            gate.e_score_correction_bias,
+            gate.top_k,
+            gate.routed_scaling_factor,
+            gate.norm_topk_prob,
+        )
+        assert mx.array_equal(indices.reshape(rows, -1), fp32[0]).item()
+        assert _mismatches(scores.reshape(rows, -1), fp32[1]) == 0
+        if rows == 1:
+            monkeypatch.setattr(language, "_DECODE_FUSION", False)
+            ref_indices, ref_scores = gate(x)
+            monkeypatch.setattr(language, "_DECODE_FUSION", True)
+            assert mx.array_equal(indices, ref_indices).item()
+            assert _mismatches(scores, ref_scores) == 0
+
+
+_FUSED_ROUTER = dk.moe_router
+
+
+@pytest.fixture
+def verify_router(monkeypatch):
+    """The production verify router, in place of ``_pin_verify_router``."""
+    monkeypatch.setattr(dk, "moe_router", _FUSED_ROUTER)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("rows", [2, 3, 4, 8])
+def test_verify_rows_route_like_their_decode_step(rows):
+    gate = _router(seed=rows)
+    for trial in range(3):
+        x = (mx.random.normal((1, rows, 4096)) * (0.3 + trial)).astype(mx.bfloat16)
+        before = _stats()["router"]
+        indices, scores = gate(x)
+        assert _stats()["router"] == before + 1
+        for r in range(rows):
+            one_idx, one_scores = gate(x[:, r : r + 1])
+            assert mx.array_equal(indices[:, r : r + 1], one_idx).item(), (trial, r)
+            assert _mismatches(scores[:, r : r + 1], one_scores) == 0, (trial, r)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("batch,rows,groups", [(2, 4, 1), (1, 9, 1), (1, 4, 2)])
+def test_router_keeps_the_reference_outside_verify_blocks(
+    batch, rows, groups, monkeypatch
+):
+    language = _language()
+    gate = _router(experts=128, hidden=1024, seed=5)
+    gate.n_group = groups
+    x = (mx.random.normal((batch, rows, 1024)) * 0.7).astype(mx.bfloat16)
+    before = _stats()["router"]
+    indices, scores = gate(x)
+    assert _stats()["router"] == before
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    ref_idx, ref_scores = gate(x)
+    assert mx.array_equal(indices, ref_idx).item()
+    assert _mismatches(scores, ref_scores) == 0
+
+
+# ---------------------------------------------------------------------------
+# Latent MLA attention (64 heads, as in GLM-5.3)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Projections sharing one input (MLA q_a / kv_a / indexer wk, weights_proj)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("tokens", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_multi_qmv_is_bitwise_separate_projections(tokens, bits):
+    language = _language()
+    mx.random.seed(tokens * 10 + bits)
+    k = 1024
+    layers = [_quantized_linear(n, k, bits) for n in (512, 136, 128, 32)]
+    x = (mx.random.normal((1, tokens, k)) * 0.7).astype(mx.bfloat16)
+    for count in (1, 2, 4):
+        group = layers[:count]
+        fused = dk.multi_qmv(x.reshape(tokens, k), group)
+        assert fused is not None
+        for layer, out in zip(group, fused):
+            reference = language.linear_forward(layer, x).reshape(tokens, -1)
+            assert _mismatches(out, reference) == 0, (count, layer.weight.shape)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_qmv_covers_one_token_3bit_projections():
+    """3-bit weights replay qmv_fast for one token; multi-row products keep
+    the reference call (qmv_wide is replayed for 4/5/6/8 bits)."""
+    language = _language()
+    mx.random.seed(31)
+    k = 1024
+    layers = [_quantized_linear(n, k, 3) for n in (512, 136, 128, 32)]
+    x = (mx.random.normal((1, 1, k)) * 0.7).astype(mx.bfloat16)
+    fused = dk.multi_qmv(x.reshape(1, k), layers)
+    assert fused is not None
+    for layer, out in zip(layers, fused):
+        reference = language.linear_forward(layer, x).reshape(1, -1)
+        assert _mismatches(out, reference) == 0, layer.weight.shape
+    assert dk.multi_qmv(mx.zeros((2, k), mx.bfloat16), layers) is None
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_qmv_declines_uncovered_projections():
+    mx.random.seed(3)
+    x = (mx.random.normal((1, 1024)) * 0.7).astype(mx.bfloat16)
+    eight, six = _quantized_linear(256, 1024, 8), _quantized_linear(256, 1024, 6)
+    assert dk.multi_qmv(x, [eight, six]) is None  # mixed bits
+    assert dk.multi_qmv(x, [eight, _quantized_linear(12, 1024, 8)]) is None
+    biased = nn.QuantizedLinear(1024, 256, bias=True, bits=8)
+    assert dk.multi_qmv(x, [eight, biased]) is None
+    assert dk.multi_qmv(x, [eight, nn.Linear(1024, 256, bias=False)]) is None
+    assert dk.multi_qmv(mx.zeros((9, 1024), mx.bfloat16), [eight]) is None
+    # one token: qmv_fast shapes only (4-bit needs K % 512 == 0)
+    four = _quantized_linear(256, 1280, 4)
+    assert dk.multi_qmv(mx.zeros((1, 1280), mx.bfloat16), [four, four]) is None
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_linear_groups_projections_by_quantization():
+    language = _language()
+    mx.random.seed(5)
+    x = (mx.random.normal((1, 3, 1024)) * 0.7).astype(mx.bfloat16)
+    layers = [
+        _quantized_linear(512, 1024, 6),
+        _quantized_linear(256, 1024, 8),
+        _quantized_linear(128, 1024, 6),
+        _quantized_linear(32, 1024, 8),
+    ]
+    before = _stats()["multi_qmv"]
+    outs = language._multi_linear(x, layers)
+    assert _stats()["multi_qmv"] == before + 2
+    for layer, out in zip(layers, outs):
+        assert _mismatches(out, language.linear_forward(layer, x)) == 0
+    assert language._multi_linear(x, layers[:2]) is None
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("tokens", [2, 5, 8])
+def test_down_combine_folds_glm_shared_down_bitwise(tokens):
+    """GLM-5.3 shapes: routed down 4-bit [E, 4096, 2048], shared down 8-bit."""
+    language = _language()
+    mx.random.seed(tokens)
+    routed = _switch_linear(10, 4096, 2048, 4)
+    shared = _quantized_linear(4096, 2048, 8)
+    act = (mx.random.normal((tokens, 8, 2048)) * 0.3).astype(mx.bfloat16)
+    shared_act = (mx.random.normal((tokens, 2048)) * 0.3).astype(mx.bfloat16)
+    idx = mx.stack([mx.random.permutation(10)[:8] for _ in range(tokens)]).astype(
+        mx.uint32
+    )
+    scores = mx.random.uniform(0.05, 0.4, (tokens, 8))
+    shared_y = language.linear_forward(
+        shared, shared_act.reshape(1, tokens, -1)
+    ).reshape(tokens, -1)
+    reference = dk.moe_down_combine(act, idx, scores, routed, shared_y=shared_y)
+    fused = dk.moe_down_combine(act, idx, scores, routed, shared, shared_act=shared_act)
+    assert fused is not None and reference is not None
+    assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("seed", [44, 48])
+@pytest.mark.parametrize("prompt_len", [300, 2101])
+def test_small_model_seed_sweep_is_bitwise_reference(seed, prompt_len):
+    heads = 8
+    if prompt_len > 2048 and not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    _check_small_model(seed, prompt_len, heads)
+
+
+def _fuse_gate_up(switch_mlp):
+    """The MoE gate/up fusion's layout: gate_up_proj = [gate; up] rows per
+    expert (omlx.patches.moe_gate_up_fusion._fuse_one)."""
+    gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
+    fused = {
+        f: mx.concatenate([gate[f], up[f]], axis=1)
+        for f in ("weight", "scales", "biases")
+    }
+    mx.eval(list(fused.values()))
+    for field, value in fused.items():
+        setattr(gate, field, value)
+    switch_mlp.gate_up_proj = gate
+    del switch_mlp.gate_proj
+    del switch_mlp.up_proj
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 2, 5, 8])
+def test_decode_experts_read_fused_gate_up_layout(length, monkeypatch):
+    language = _language()
+    moe = _moe(seed=10 + length)
+    x = (mx.random.normal((1, length, 1024)) * 0.7).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    split = moe._decode_experts(x, indices, scores)
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    if split is None:  # 64 routes: sorted, left to SwitchGLU
+        assert length == 8
+    else:
+        assert _mismatches(split, reference) == 0
+    _fuse_gate_up(moe.switch_mlp)
+    fused = moe._decode_experts(x, indices, scores)
+    assert (fused is None) == (split is None)
+    if fused is not None:
+        assert _mismatches(fused, split) == 0
+    if hasattr(type(moe.switch_mlp), "projections"):
+        # This build's SwitchGLU runs the fused layout (MoE gate/up fusion).
+        monkeypatch.setattr(language, "_DECODE_FUSION", False)
+        fused_reference = moe(x)
+        monkeypatch.setattr(language, "_DECODE_FUSION", True)
+        assert _mismatches(fused_reference, reference) == 0
+        assert _mismatches(moe(x), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch):
+    """Caches written by upstream's fused KDA prefill (glm53_kda_prework,
+    >= 64-row chunks; the test prompts' 512-token chunks) feed the fused
+    decode and verify paths exactly like the stock prefill's."""
+    try:
+        from omlx.patches import glm53_kda_prework as prework
+    except ImportError:
+        pytest.skip("this build has no glm53 fused KDA prefill")
+    _language()
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+
+    monkeypatch.setattr(prework, "_GLM53_KDA_ENGAGED_LOGGED", False)
+    used = _check_small_model() | _check_small_model(43, 300)
+    assert prework._GLM53_KDA_ENGAGED_LOGGED
+    assert _CORE_FUSED <= used, used
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("every", [1, 3])
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_decode_early_eval_only_schedules(every, width, monkeypatch):
+    """Decode/verify forwards evaluate every few layers while the graph is
+    still being built; the logits and caches are those of the lazy forward."""
+    language = _language()
+    model = _fused_shape_model(seed=45)
+    prompt = mx.random.randint(0, 256, (1, 300)).astype(mx.int32)
+    caches = []
+    for _ in range(2):
+        cache = model.make_cache()
+        mx.eval(model(prompt, cache=cache).logits)
+        caches.append(cache)
+    calls = []
+    real_async_eval = mx.async_eval
+
+    def counting_async_eval(*args):
+        calls.append(len(args))
+        return real_async_eval(*args)
+
+    token = mx.arange(17, 17 + width, dtype=mx.int32)[None]
+    for step in range(3):
+        monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", 0)
+        lazy = model(token, cache=caches[0]).logits
+        mx.eval(lazy)
+        monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", every)
+        monkeypatch.setattr(mx, "async_eval", counting_async_eval)
+        early = model(token, cache=caches[1]).logits
+        monkeypatch.setattr(mx, "async_eval", real_async_eval)
+        mx.eval(early)
+        assert _mismatches(early, lazy) == 0, f"step {step}"
+        token = mx.argmax(lazy, axis=-1).astype(mx.int32)
+    # 4 layers: evaluations after layers `every`, 2 * every, ... (not the last).
+    assert len(calls) == 3 * len(range(every, 4, every))
+    for a, b in zip(caches[0], caches[1]):
+        for x, y in zip(a.state, b.state):
+            if isinstance(x, mx.array):
+                assert _mismatches(x, y) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_compiled_decode_releases_the_weights_when_the_model_is_dropped():
+    """One-token steps compile each layer's FFN half around multi-output fused
+    kernels (router logits, route-selecting gate/up, HC pre/post). A compiled
+    trace that leaks such intermediates (ml-explore/mlx#4453, fixed in MLX
+    0.32.3) keeps the weights it captured as constants, so dropping the model
+    left MoE layers' routed gate/up experts allocated (~73 MB per layer here,
+    ~2.5 GB on GLM-5.3). Runs on a worker thread whose final
+    ``mx.clear_streams()`` drops its compile cache, like an engine thread."""
+    import gc
+    import threading
+
+    result = {}
+
+    def work():
+        gc.collect()
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        # Pausing the collector makes such a leak deterministic here (one to
+        # three MoE layers' gate/up experts).
+        gc.disable()
+        try:
+            run()
+        finally:
+            gc.enable()
+        gc.collect()
+        mx.synchronize()
+        mx.clear_streams()
+        gc.collect()
+        mx.clear_cache()
+        result["leak"] = mx.get_active_memory() - base
+
+    def run():
+        model = _fused_shape_model(7)
+        cache = model.make_cache()
+        prompt = mx.random.randint(0, 256, (1, 64)).astype(mx.int32)
+        logits = model(prompt, cache=cache).logits
+        token = mx.argmax(logits[:, -1:], axis=-1).astype(mx.int32)
+        before = dict(_stats())
+        for _ in range(3):
+            logits = model(token, cache=cache).logits
+            token = mx.argmax(logits[:, -1:], axis=-1).astype(mx.int32)
+            mx.eval(token)
+        result["router_select_fused"] = _stats()["router_select_fused"] - before.get(
+            "router_select_fused", 0
+        )
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    worker.join()
+    assert result["router_select_fused"] > 0  # the compiled fused MoE path ran
+    assert result["leak"] < (1 << 20), f"{result['leak']} bytes still active"
+
+
+# ---------------------------------------------------------------------------
+# Compiled decode FFN
+
+
+_CFFN_WORDS = 1 << 21  # 8 MB of float32 per weight: a pinned weight is unmistakable
+
+
+_CFFN_KERNELS = {}
+
+
+def _cffn_kernel(n_in: int, n_out: int):
+    """out_j[i] = sum_k in_k[i] + j (a stand-in for the fused decode kernels)."""
+    key = (n_in, n_out)
+    if key not in _CFFN_KERNELS:
+        total = " + ".join(f"in{k}[i]" for k in range(n_in))
+        _CFFN_KERNELS[key] = mx.fast.metal_kernel(
+            name=f"compile_ffn_probe_{n_in}_{n_out}",
+            input_names=[f"in{k}" for k in range(n_in)],
+            output_names=[f"out{j}" for j in range(n_out)],
+            source="uint i = thread_position_in_grid.x;\n"
+            + "".join(f"out{j}[i] = {total} + {j};\n" for j in range(n_out)),
+        )
+    return _CFFN_KERNELS[key]
+
+
+def _cffn_run(inputs, n_out):
+    return _cffn_kernel(len(inputs), n_out)(
+        inputs=inputs,
+        grid=(8, 1, 1),
+        threadgroup=(8, 1, 1),
+        output_shapes=[(8,)] * n_out,
+        output_dtypes=[mx.float32] * n_out,
+    )
+
+
+class _CffnWeights(nn.Module):
+    def __init__(self, offset: float):
+        super().__init__()
+        self.weight = mx.arange(_CFFN_WORDS, dtype=mx.float32) * 1e-6 + offset
+
+
+class _CffnLayer(nn.Module):
+    """The FFN half of a decoder layer, with the leaking topology: multi-output
+    kernels fed by the weights whose outputs feed further kernels."""
+
+    def __init__(self):
+        super().__init__()
+        self.ffn_hc = _CffnWeights(1.0)
+        self.post_attention_layernorm = _CffnWeights(2.0)
+        self.mlp = _CffnWeights(3.0)
+        self.mlp.experts = [_CffnWeights(4.0)]
+
+    def _ffn_block(self, x):
+        a, b = _cffn_run([x, self.ffn_hc.weight], 2)  # like the router logits kernel
+        act, routes, scores = _cffn_run(
+            [a, b, self.mlp.weight, self.mlp.experts[0].weight], 3
+        )  # like the route-selecting gate/up kernel
+        y = _cffn_run([act, routes, scores, self.post_attention_layernorm.weight], 1)[0]
+        return y * 2
+
+
+def _leaked_bytes(compile_fn) -> int:
+    """Build, run and drop a layer on a worker thread (like an engine thread,
+    whose final reclaim clears its compile cache); bytes left behind."""
+    result = {}
+
+    def work():
+        gc.collect()
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        layer = _CffnLayer()
+        mx.eval(layer.parameters())
+        x = mx.ones((8,), dtype=mx.float32)
+        mx.eval(compile_fn(layer)(x))
+        del layer, x
+        gc.collect()
+        mx.synchronize()
+        mx.clear_streams()
+        gc.collect()
+        mx.clear_cache()
+        result["leak"] = mx.get_active_memory() - base
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    worker.join()
+    return result["leak"]
+
+
+def test_compiled_ffn_block_releases_the_layer_weights():
+    leak = _leaked_bytes(lambda layer: mx.compile(layer._ffn_block))
+    # A pinned weight would leave 8 MB+; only tiny trace constants may remain.
+    assert leak < (64 << 10), f"{leak} bytes still active after the layer was dropped"
+
+
+def _stock_verify_router(fused):
+    """Leave verify rows to the stock router.
+
+    Fused-vs-reference checks then compare the other kernels on the same
+    expert choices. The verify router has its own tests.
+    """
+
+    def router(x, *args, **kwargs):
+        return None if x.shape[0] > 1 else fused(x, *args, **kwargs)
+
+    return router
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_sanitize_dequantizes_quantized_router_gate(bits):
+    config_dict = _tiny_config_dict()
+    config_dict["text_config"]["hidden_size"] = 256
+    sanitizer = _build_model_sanitizer(config_dict)
+    gate = mx.random.normal((8, 256)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=128, bits=bits)
+    prefix = "model.language_model.layers.0.mlp.gate."
+    sanitized = sanitizer(
+        {
+            prefix + "weight": packed,
+            prefix + "scales": scales,
+            prefix + "biases": biases,
+        }
+    )
+
+    out = "language_model.model.layers.0.mlp.gate."
+    assert out + "scales" not in sanitized
+    assert out + "biases" not in sanitized
+    expected = mx.dequantize(packed, scales, biases, group_size=128, bits=bits)
+    assert sanitized[out + "weight"].dtype == mx.float32
+    assert mx.array_equal(sanitized[out + "weight"], expected.astype(mx.float32)).item()
+
+
+def test_sanitize_keeps_unquantized_router_gate():
+    config_dict = _tiny_config_dict()
+    sanitizer = _build_model_sanitizer(config_dict)
+    hidden = config_dict["text_config"]["hidden_size"]
+    gate = mx.random.normal((8, hidden)).astype(mx.bfloat16)
+    sanitized = sanitizer({"model.language_model.layers.0.mlp.gate.weight": gate})
+    weight = sanitized["language_model.model.layers.0.mlp.gate.weight"]
+    assert weight.dtype == mx.float32
+    assert mx.array_equal(weight, gate.astype(mx.float32)).item()
+
+
+def test_sanitize_rejects_invalid_router_quantization_shapes():
+    sanitizer = _build_model_sanitizer(_tiny_config_dict())
+    prefix = "model.language_model.layers.0.mlp.gate."
+    with pytest.raises(ValueError, match="mlp.gate.weight.*cannot infer quantization"):
+        sanitizer(
+            {
+                prefix + "weight": mx.zeros((8, 4), dtype=mx.uint32),
+                prefix + "scales": mx.ones((8, 3)),
+                prefix + "biases": mx.zeros((8, 3)),
+            }
+        )
+
+
+def test_load_model_dequantizes_quantized_router_gate(monkeypatch):
+    import mlx_vlm.utils as utils
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models import glm5_next
+
+    config = _tiny_config_dict()
+    config["text_config"].update(
+        hidden_size=128,
+        n_routed_experts=8,
+        mlp_layer_types=["sparse", "sparse"],
+        first_k_dense_replace=0,
+    )
+    args = glm5_next.ModelConfig.from_dict(config)
+    args = utils.update_module_configs(args, glm5_next, config, ["text", "vision"])
+    weights = dict(tree_flatten(glm5_next.Model(args).parameters()))
+    gate = mx.random.normal((8, 128)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=32, bits=4)
+    key = "language_model.model.layers.0.mlp.gate"
+    weights.update(
+        {key + ".weight": packed, key + ".scales": scales, key + ".biases": biases}
+    )
+    config["quantization"] = {"bits": 4, "group_size": 32}
+    monkeypatch.setattr(utils, "load_config", lambda *_a, **_kw: config)
+    monkeypatch.setattr(
+        utils.glob, "glob", lambda *_a, **_kw: ["/fixture/router.safetensors"]
+    )
+    monkeypatch.setattr(utils, "_load_safetensors", lambda *_a, **_kw: weights)
+
+    loaded = utils.load_model(Path("/fixture/router"), lazy=True, strict=True)
+    router = loaded.language_model.model.layers[0].mlp.gate
+    expected = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
+    assert router.weight.dtype == mx.float32
+    assert mx.array_equal(router.weight, expected.astype(mx.float32)).item()
+
+
+@pytest.fixture(autouse=True)
+def _pin_verify_router(monkeypatch):
+    monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))
+
+
+def _indexer_reference(q, pool_keys, weights):
+    f32 = mx.float32
+    scores = q.astype(f32) @ pool_keys[:, None].astype(f32).swapaxes(-1, -2)
+    return mx.sum(weights.astype(f32)[..., None] * mx.maximum(scores, 0), axis=2)
+
+
+def _assert_matches_indexer_reference(actual, q, pool_keys, weights):
+    reference = _indexer_reference(q, pool_keys, weights)
+    mx.eval(actual, reference)
+    assert actual.shape == reference.shape
+    assert mx.allclose(
+        actual.astype(mx.float32), reference, atol=0.08, rtol=0.02
+    ).item()
+
+
+def _native_decode_indexer():
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    config = _tiny_config().text_config
+    config.index_n_heads = 32
+    config.index_head_dim = 128
+    config.index_kpool = 4
+    config.index_topk = 2048
+    indexer = Glm5NextIndexer(config)
+    indexer.set_dtype(mx.bfloat16)
+    return indexer, config
+
+
+def _pin_gpu_without_fused_decode(monkeypatch):
+    # A GPU where _fast_short_select never serves one sequence's short rows,
+    # so _native_scores sends its decode rows to the decode scan.
+    monkeypatch.setattr(dk, "fused_decode_supported", lambda: False)
+
+
+def _require_native_kernel(symbol):
+    from omlx.custom_kernels.sparse_index import fast
+
+    if not fast.has_symbol(symbol):
+        pytest.skip(f"GLM DSA native {symbol} kernel is not built")
+    return fast
+
+
+def _count_kernel_calls(monkeypatch, fast, symbol):
+    calls = []
+    kernel = getattr(fast, symbol)
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(fast, symbol, counted)
+    return calls
+
+
+def _forbid_padded_tile(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_indexer_scores",
+        lambda *a, **k: pytest.fail("decode must not use the padded prefill tile"),
+    )
+
+
+@pytest.mark.parametrize("pool_len,native", [(1023, False), (1024, True), (8199, True)])
+def test_glm5_next_decode_indexer_uses_fused_decode_scan(pool_len, native, monkeypatch):
+    fast = _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_decode_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(29)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((2, pool_len, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+@pytest.mark.parametrize(
+    "batch,rows,native", [(2, 2, False), (2, 31, False), (2, 32, True), (1, 25, True)]
+)
+def test_glm5_next_indexer_skips_the_tile_only_for_short_batched_queries(
+    batch, rows, native, monkeypatch
+):
+    fast = _require_native_kernel("dsa_indexer_scores")
+    _pin_gpu_without_fused_decode(monkeypatch)
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_indexer_scores")
+    mx.random.seed(61)
+    q = (mx.random.normal((batch, rows, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((batch, 4100, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((batch, rows, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def test_glm5_next_decode_indexer_reads_non_row_contiguous_keys():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(31)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    transposed = (mx.random.normal((2, 128, 4099)) * 0.5).astype(mx.bfloat16)
+    mx.eval(transposed)
+    keys = transposed.swapaxes(1, 2)  # last-axis stride != 1
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def test_glm5_next_decode_scan_matches_reference_in_float16():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(67)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.float16)
+    keys = (mx.random.normal((2, 4096, 128)) * 0.5).astype(mx.float16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.float16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    assert actual.dtype == mx.float16
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def _forbid_decode_scan(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_decode_scores",
+        lambda *a, **k: pytest.fail("the decode scan must not run here"),
+    )
+
+
+# The tests below replace the kernels with Python stand-ins, so they pin the
+# routing on every build, with or without the native extension or a GPU.
+
+
+@pytest.mark.parametrize("rows,pool_len", [(1, 8192), (1, 100), (2, 8192), (31, 8192)])
+def test_glm5_next_indexer_without_the_decode_scan_never_pads_short_batched_queries(
+    rows, pool_len, monkeypatch
+):
+    from omlx.custom_kernels.sparse_index import fast
+
+    # Only the prefill tile is built: short batched queries still take the fallback.
+    _pin_gpu_without_fused_decode(monkeypatch)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: name == "dsa_indexer_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    q = mx.zeros((2, rows, 32, 128), dtype=mx.bfloat16)
+    keys = mx.zeros((2, pool_len, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((2, rows, 32), dtype=mx.bfloat16)
+    assert indexer._native_scores(q, keys, weights) is None
+
+
+def test_glm5_next_decode_scan_receives_the_kernel_call_shapes(monkeypatch):
+    from omlx.custom_kernels.sparse_index import fast
+
+    seen = {}
+
+    def decode_scan(q, keys, weights):
+        seen.update(q=q.shape, keys=keys.shape, weights=weights.shape)
+        return mx.zeros((q.shape[0], 1, 1, keys.shape[2]), dtype=q.dtype)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "dsa_decode_scores", decode_scan)
+    _forbid_padded_tile(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    scores = indexer._native_scores(
+        mx.zeros((3, 1, 32, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 5000, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 1, 32), dtype=mx.bfloat16),
+    )
+    # q [B,H,1,D], keys [B,1,P,D], weights [B,H] in; scores [B,1,P] out.
+    assert seen == {"q": (3, 32, 1, 128), "keys": (3, 1, 5000, 128), "weights": (3, 32)}
+    assert scores.shape == (3, 1, 5000)
+
+
+@pytest.mark.parametrize(
+    "batch,rows,fused_gpu,route",
+    [
+        (1, 1, True, "tile"),
+        (1, 8, True, "tile"),
+        (1, 9, True, "tile"),
+        (2, 1, True, "scan"),
+        (2, 4, True, None),
+        (1, 1, False, "scan"),
+        (1, 8, False, "tile"),
+    ],
+)
+def test_glm5_next_indexer_routes_short_queries(
+    batch, rows, fused_gpu, route, monkeypatch
+):
+    from omlx.custom_kernels.sparse_index import fast
+
+    taken = []
+
+    def tile(qt, keys, weights, causal=True, **_kwargs):
+        taken.append("tile")
+        return mx.zeros((qt.shape[0], 1, qt.shape[2], keys.shape[2]), dtype=qt.dtype)
+
+    def scan(q, keys, weights, **_kwargs):
+        taken.append("scan")
+        return mx.zeros((q.shape[0], 1, 1, keys.shape[2]), dtype=q.dtype)
+
+    monkeypatch.setattr(dk, "fused_decode_supported", lambda: fused_gpu)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "dsa_indexer_scores", tile)
+    monkeypatch.setattr(fast, "dsa_decode_scores", scan)
+    indexer, _ = _native_decode_indexer()
+    scores = indexer._native_scores(
+        mx.zeros((batch, rows, 32, 128), dtype=mx.bfloat16),
+        mx.zeros((batch, 5000, 128), dtype=mx.bfloat16),
+        mx.zeros((batch, rows, 32), dtype=mx.bfloat16),
+    )
+    assert taken == ([route] if route else [])
+    assert (scores is None) is (route is None)
+    if scores is not None:
+        assert scores.shape == (batch, rows, 5000)
+
+
+@pytest.mark.parametrize("rows", [1, 37])
+def test_glm5_next_indexer_falls_back_when_the_pool_dtype_differs(rows, monkeypatch):
+    from omlx.custom_kernels.sparse_index import fast
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    assert (
+        indexer._native_scores(
+            mx.zeros((1, rows, 32, 128), dtype=mx.bfloat16),
+            mx.zeros((1, 5000, 128), dtype=mx.float16),
+            mx.zeros((1, rows, 32), dtype=mx.bfloat16),
+        )
+        is None
+    )
+
+
+def _feed_indexer(indexer, config, cache, tokens, seed):
+    mx.random.seed(seed)
+    shape = (1, tokens)
+    x = mx.random.normal((*shape, config.hidden_size)) * 0.5
+    qr = mx.random.normal((*shape, config.q_lora_rank)) * 0.5
+    out = indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache)
+    mx.eval(out)
+
+
+def _decode_step_matches_reference(indexer, config, cache, batch, monkeypatch):
+    from mlx_vlm.models.glm5_next import language
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.sparse_index import fast
+
+    # On M3 and newer GPUs a one-sequence decode step takes the fused decode
+    # selection (on M5 also the NAX indexer) instead of _native_scores, and
+    # _native_scores keeps the padded tile for those rows as that path's
+    # exact reference. Pin a GPU without the fused path, the route a batched
+    # step takes on every GPU, so these tests check the scan for one
+    # sequence too.
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
+    _pin_gpu_without_fused_decode(monkeypatch)
+    seen = []
+    original = Glm5NextIndexer._native_scores
+
+    def spy(self, q, pool_keys, weights):
+        out = original(self, q, pool_keys, weights)
+        seen.append((q, pool_keys, weights, out))
+        return out
+
+    monkeypatch.setattr(Glm5NextIndexer, "_native_scores", spy)
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(37)
+    x = mx.random.normal((batch, 1, config.hidden_size)) * 0.5
+    qr = mx.random.normal((batch, 1, config.q_lora_rank)) * 0.5
+    mx.eval(indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache))
+    assert len(seen) == 1
+    q, pool_keys, weights, actual = seen[0]
+    assert q.shape[1] == 1 and pool_keys.shape[1] >= 4096
+    assert actual is not None, "decode must take the native scan at this depth"
+    _assert_matches_indexer_reference(actual, q, pool_keys, weights)
+
+
+def test_glm5_next_decode_scan_matches_reference_through_pooling_cache(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    cache = PoolingCache(4)
+    # Two prefill chunks so the pool buffer grows past its first allocation.
+    _feed_indexer(indexer, config, cache, 8192, seed=41)
+    _feed_indexer(indexer, config, cache, 8210, seed=43)
+    _decode_step_matches_reference(indexer, config, cache, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_after_state_restore(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    source = PoolingCache(4)
+    _feed_indexer(indexer, config, source, 16410, seed=47)
+    restored = PoolingCache(4)
+    restored.state = source.state
+    restored.meta_state = source.meta_state
+    _decode_step_matches_reference(indexer, config, restored, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_for_batched_unequal_pools(
+    monkeypatch,
+):
+    from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    first, second = PoolingCache(4), PoolingCache(4)
+    _feed_indexer(indexer, config, first, 16400, seed=53)
+    _feed_indexer(indexer, config, second, 17003, seed=59)
+    batch = BatchPoolingCache.merge([first, second])
+    _decode_step_matches_reference(indexer, config, batch, 2, monkeypatch)

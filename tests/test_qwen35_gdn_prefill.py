@@ -53,17 +53,12 @@ def _fresh_gdn_patch(monkeypatch):
     import omlx.patches.qwen35_gdn_chunked as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
-    monkeypatch.delenv("OMLX_GDN_KERNEL", raising=False)
-    monkeypatch.delenv("OMLX_GDN_IMPL", raising=False)
-    monkeypatch.delenv("OMLX_GDN_BLOCK_T", raising=False)
-    monkeypatch.delenv("OMLX_GDN_MIN_T", raising=False)
-    monkeypatch.delenv("OMLX_GDN_STUB", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
 
 
 def test_prefill_patch_routes_default_pipelined(monkeypatch):
-    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.custom_kernels.attention.gated_delta as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
     gd, lang = _install_fake_qwen35(monkeypatch)
@@ -97,12 +92,12 @@ def test_prefill_patch_routes_default_pipelined(monkeypatch):
 
 
 def test_prefill_patch_blocked_seq_impl_opt_in(monkeypatch):
-    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.custom_kernels.attention.gated_delta as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
     gd, _ = _install_fake_qwen35(monkeypatch)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_GDN_IMPL", "blocked_seq")
+    monkeypatch.setattr(patch, "_IMPL", "blocked_seq")
     calls = []
     monkeypatch.setattr(
         kernels,
@@ -126,7 +121,7 @@ def test_prefill_patch_blocked_seq_impl_opt_in(monkeypatch):
 
 
 def test_prefill_patch_passthrough_for_decode_mask_and_unsupported_shape(monkeypatch):
-    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.custom_kernels.attention.gated_delta as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
     gd, _ = _install_fake_qwen35(monkeypatch)
@@ -165,13 +160,55 @@ def test_prefill_patch_passthrough_for_decode_mask_and_unsupported_shape(monkeyp
     )
 
 
-def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
-    import omlx.custom_kernels.qwen35_prefill as kernels
+def test_prefill_patch_rejects_non_128_head_dims_satisfying_old_modulus(
+    monkeypatch,
+):
+    """E2: the route gate used to admit any Dk % 16 == 0 / Dv % 32 == 0, but
+    both the chunked kernel (A) and the default blocked_seq kernel (S)
+    hard-assume Dk=128/Dv=128 internally -- a shape satisfying the old
+    modulus without being exactly 128 would silently misbehave rather than
+    error. Dk=144 (16*9) and Dv=160 (32*5) both satisfy the old modulus but
+    must now be rejected.
+    See docs/qwen35-hardening-and-optimization.md E2."""
+    import omlx.custom_kernels.attention.gated_delta as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
     gd, _ = _install_fake_qwen35(monkeypatch)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_GDN_IMPL", "chunked")
+    monkeypatch.setattr(
+        kernels,
+        "gated_delta_blocked_seq",
+        lambda *args: pytest.fail("blocked kernel should not be routed"),
+    )
+
+    assert patch.apply_qwen35_gdn_prefill_patch() is True
+
+    a = _Tensor((1, 128, 48))
+
+    # Dk=144: divisible by 16 (old gate), not 128 (new gate).
+    q_bad_dk = _Tensor((1, 128, 16, 144))
+    v_ok = _Tensor((1, 128, 48, 128))
+    assert (
+        gd.gated_delta_update(q_bad_dk, q_bad_dk, v_ok, a, None, None, None)[0]
+        == "original"
+    )
+
+    # Dv=160: divisible by 32 (old gate), not 128 (new gate).
+    q_ok = _Tensor((1, 128, 16, 128))
+    v_bad_dv = _Tensor((1, 128, 48, 160))
+    assert (
+        gd.gated_delta_update(q_ok, q_ok, v_bad_dv, a, None, None, None)[0]
+        == "original"
+    )
+
+
+def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
+    import omlx.custom_kernels.attention.gated_delta as kernels
+    import omlx.patches.qwen35_gdn_chunked as patch
+
+    gd, _ = _install_fake_qwen35(monkeypatch)
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_IMPL", "chunked")
 
     calls = []
     monkeypatch.setattr(
@@ -190,15 +227,12 @@ def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
     assert calls == ["chunked"]
 
 
-def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
-    from omlx.custom_kernels.qwen35_prefill.gdn import _normalize_block_t
+def test_blocked_seq_default_block_size_depends_on_input_dtype():
+    from omlx.custom_kernels.attention.gated_delta import _normalize_block_t
 
     assert _normalize_block_t(None, mx.float32) == 16
     assert _normalize_block_t(None, mx.bfloat16) == 32
     assert _normalize_block_t(None, mx.float16) == 32
-
-    monkeypatch.setenv("OMLX_GDN_BLOCK_T", "48")
-    assert _normalize_block_t(None, mx.float32) == 48
     assert _normalize_block_t(32, mx.float32) == 32
 
 
@@ -206,7 +240,7 @@ def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
 def test_blocked_seq_matches_stock_kernel_small():
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
-    from omlx.custom_kernels.qwen35_prefill import gated_delta_blocked_seq
+    from omlx.custom_kernels.attention.gated_delta import gated_delta_blocked_seq
 
     B, T, Hk, Hv, Dk, Dv = 1, 128, 16, 48, 128, 128
     keys = [mx.random.key(i) for i in range(6)]
@@ -234,7 +268,7 @@ def test_blocked_seq_matches_stock_kernel_small():
 def test_blocked_seq_float32_default_fits_threadgroup_memory():
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
-    from omlx.custom_kernels.qwen35_prefill import gated_delta_blocked_seq
+    from omlx.custom_kernels.attention.gated_delta import gated_delta_blocked_seq
 
     # Exact GDN layout from issue #2162. With float32 inputs, TB=32 requires
     # 40,192 bytes of threadgroup memory and cannot load on a 32 KiB device.
@@ -274,13 +308,13 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.qwen3_5 import gated_delta, language
 
-    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.custom_kernels.attention.gated_delta as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
     monkeypatch.setattr(gated_delta, "gated_delta_update", gated_delta.gated_delta_update)
     monkeypatch.setattr(language, "gated_delta_update", language.gated_delta_update)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    initial = mx.zeros((1, 1, 32, 32))
+    initial = mx.zeros((1, 1, 128, 128))
     final = mx.ones_like(initial)
     calls = []
 
@@ -292,7 +326,7 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     assert patch.apply_qwen35_gdn_prefill_patch()
     cache = ArraysCache(2)
     cache[1] = initial
-    q = mx.zeros((1, 64, 1, 32))
+    q = mx.zeros((1, 64, 1, 128))
     a = mx.zeros((1, 64, 1))
     output, state = gated_delta.gated_delta_update(
         q, q, q, a, a, mx.zeros((1,)), mx.zeros((1,)), cache=cache
@@ -354,7 +388,7 @@ def _gdn_reference_fp64(q, k, v, g, beta, state):
 def test_pipelined_matches_stock_kernel(T):
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
-    from omlx.custom_kernels.qwen35_prefill import gated_delta_pipelined
+    from omlx.custom_kernels.attention.gated_delta import gated_delta_pipelined
 
     q, k, v, g, beta, state = _gdn_inputs(1, T, 16, 48, mx.bfloat16, seed=T)
     y_ref, s_ref = gated_delta_kernel(q, k, v, g, beta, state)
@@ -373,7 +407,7 @@ def test_pipelined_matches_stock_kernel(T):
 def test_pipelined_float32_matches_fp64_reference(Hk, Hv):
     import numpy as np
 
-    from omlx.custom_kernels.qwen35_prefill import gated_delta_pipelined
+    from omlx.custom_kernels.attention.gated_delta import gated_delta_pipelined
 
     q, k, v, g, beta, state = _gdn_inputs(2, 29, Hk, Hv, mx.float32, seed=Hv)
     y, s = gated_delta_pipelined(q, k, v, g, beta, state)
@@ -388,7 +422,7 @@ def test_pipelined_float32_matches_fp64_reference(Hk, Hv):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_pipelined_split_prefill_equals_one_shot():
-    from omlx.custom_kernels.qwen35_prefill import gated_delta_pipelined
+    from omlx.custom_kernels.attention.gated_delta import gated_delta_pipelined
 
     q, k, v, g, beta, _ = _gdn_inputs(1, 37, 16, 48, mx.bfloat16, seed=7)
     y_all, s_all = gated_delta_pipelined(q, k, v, g, beta, None)
@@ -406,7 +440,7 @@ def test_pipelined_split_prefill_equals_one_shot():
 
 
 def test_pipelined_falls_back_for_unsupported_layouts(monkeypatch):
-    import omlx.custom_kernels.qwen35_prefill.gdn as gdn
+    import omlx.custom_kernels.attention.gated_delta as gdn
 
     calls = []
 

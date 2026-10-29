@@ -2,14 +2,22 @@
 """Tests for the ModelScope model downloader."""
 
 import asyncio
+import json
+import logging
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask
+from omlx.admin.hf_downloader import (
+    DownloadStatus,
+    DownloadTask,
+    _DownloadActivity,
+)
 from omlx.admin.ms_downloader import (
     MSDownloader,
+    _DownloadAborted,
     _ENRICH_CACHE,
     _enrich_cache_get,
     _enrich_cache_put,
@@ -120,6 +128,23 @@ class TestParseMsModelEntry:
         result = _parse_ms_model_entry(entry)
         assert result["name"] == "my-model"
 
+    @pytest.mark.parametrize(
+        "entry,expected_repo_id",
+        [
+            (
+                {"Owner": "mlx-community", "Name": "Qwen3.8-27B-4bit"},
+                "mlx-community/Qwen3.8-27B-4bit",
+            ),
+            (
+                {"Path": "qwen", "Owner": "other", "Name": "Qwen2.5-7B"},
+                "qwen/Qwen2.5-7B",
+            ),
+        ],
+    )
+    def test_repo_id_from_path_or_owner_key(self, entry, expected_repo_id):
+        result = _parse_ms_model_entry(entry)
+        assert result["repo_id"] == expected_repo_id
+
 
 # =============================================================================
 # MSDownloader Tests
@@ -171,10 +196,11 @@ class TestMSDownloader:
                 await downloader.start_download("no-slash")
 
     @pytest.mark.asyncio
-    async def test_start_download_invalid_model_id_too_many_parts(self, downloader):
+    @pytest.mark.parametrize("model_id", ["a/b/c", "../..", "a/..", "/etc"])
+    async def test_start_download_invalid_model_id_parts(self, downloader, model_id):
         with patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True):
             with pytest.raises(ValueError, match="Invalid model ID"):
-                await downloader.start_download("a/b/c")
+                await downloader.start_download(model_id)
 
     @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):
@@ -288,6 +314,58 @@ class TestMSDownloader:
                 await downloader.shutdown()
                 if started.is_set():
                     await _wait_for(finished.is_set)
+
+    @pytest.mark.asyncio
+    async def test_cancel_stops_writer_before_retry_starts(self, downloader):
+        started = threading.Event()
+        release = threading.Event()
+        events = []
+
+        def download(**kwargs):
+            (callback,) = kwargs["progress_callbacks"]
+            if events:
+                events.append("retry")
+                return kwargs["local_dir"]
+            progress = callback("model.safetensors", 3)
+            started.set()
+            try:
+                for _ in range(3):
+                    release.wait(5)
+                    try:
+                        progress.update(1)
+                    except Exception:  # The SDK retries on any Exception.
+                        continue
+            except _DownloadAborted:
+                events.append("aborted")
+                raise
+            events.append("finished")
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+            patch("omlx.admin.ms_downloader._get_ms_api", return_value=None),
+            patch(
+                "omlx.admin.ms_downloader.ms_snapshot_download",
+                side_effect=download,
+            ),
+        ):
+            try:
+                first = await downloader.start_download("owner/model")
+                worker = downloader._active_tasks[first.task_id]
+                await _wait_for(started.is_set)
+                assert await downloader.cancel_download(first.task_id)
+                retry = await downloader.retry_download(first.task_id)
+                worker.cancel()  # Shutdown cancels again.
+                await asyncio.sleep(0.05)
+                assert downloader._active_tasks[first.task_id] is worker
+                assert retry.status == DownloadStatus.PENDING
+
+                release.set()
+                await _wait_for(lambda: retry.status == DownloadStatus.COMPLETED)
+                assert events == ["aborted", "retry"]
+                assert worker.done()
+            finally:
+                release.set()
+                await downloader.shutdown()
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_task(self, downloader):
@@ -431,16 +509,74 @@ class TestMSDownloader:
     def test_get_dir_size_nonexistent(self, tmp_path):
         assert MSDownloader._get_dir_size(tmp_path / "nonexistent") == 0
 
-    def test_get_latest_mtime_empty(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path) == 0.0
+    def test_get_download_activity_reports_all_signals_in_one_walk(
+        self, tmp_path
+    ):
+        (tmp_path / "a.bin").write_bytes(b"x" * 300)
+        activity = MSDownloader._get_download_activity(tmp_path)
+        assert activity.logical_size == 300
+        assert activity.latest_mtime_ns > 0
+        # The per-file map feeds the speed meter's continuity tracking.
+        assert activity.files[str(tmp_path / "a.bin")] >= 300
 
-    def test_get_latest_mtime_with_files(self, tmp_path):
-        (tmp_path / "a.bin").write_bytes(b"x")
-        mtime = MSDownloader._get_latest_mtime(tmp_path)
-        assert mtime > 0
+    def test_get_download_activity_nonexistent(self, tmp_path):
+        empty = MSDownloader._get_download_activity(tmp_path / "nope")
+        assert (empty.logical_size, empty.latest_mtime_ns, empty.files) == (
+            0,
+            0,
+            {},
+        )
 
-    def test_get_latest_mtime_nonexistent(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path / "nonexistent") == 0.0
+    @pytest.mark.asyncio
+    async def test_poll_reports_speed_then_zeroes_it(self, downloader, monkeypatch):
+        """ModelScope tasks publish a live rate while transferring only."""
+        import omlx.admin.ms_downloader as ms_module
+
+        monkeypatch.setattr(ms_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(ms_module, "_ETA_WARMUP", 0)
+        target = downloader.model_dir / "owner" / "model"
+        target.mkdir(parents=True, exist_ok=True)
+        task = DownloadTask(
+            task_id="t-speed",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+
+        state = {"allocated": 0}
+
+        def growing_scan(_path):
+            state["allocated"] += 150_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["allocated"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=int(time.time() * 1e9),
+                files={"payload": state["allocated"]},
+            )
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=growing_scan,
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, target)
+            )
+            # The ETA rate needs several polls; a fixed sleep can miss them.
+            for _ in range(500):
+                if task.eta_speed_bps > 0:
+                    break
+                await asyncio.sleep(0.01)
+            observed_speed = task.speed_bps
+            observed_eta_speed = task.eta_speed_bps
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert observed_speed > 0, "a live download must report a rate"
+        assert observed_eta_speed > 0, "the ETA rate must follow the transfer"
+        assert task.speed_bps == 0.0
+        assert task.eta_speed_bps == 0.0
 
 
 # =============================================================================
@@ -851,17 +987,17 @@ class TestFetchModelConfig:
 
 class TestFetchModelDetailSize:
     @pytest.mark.asyncio
-    async def test_prefers_safetensor_model_size(self):
+    async def test_ignores_safetensor_element_count(self):
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = {
             "Data": {
-                "ModelInfos": {"safetensor": {"model_size": 193153024}},
-                "StorageSize": 712593982,
+                "ModelInfos": {"safetensor": {"model_size": 4665462000}},
+                "StorageSize": 16081491610,
             }
         }
         with patch("omlx.admin.ms_downloader.requests.get", return_value=resp):
-            assert await _fetch_model_detail_size("owner/m") == 193153024
+            assert await _fetch_model_detail_size("owner/m") == 16081491610
 
     @pytest.mark.asyncio
     async def test_falls_back_to_storage_size(self):

@@ -10,9 +10,9 @@ This kernel runs the same pairs, one threadgroup per pair and output tile,
 but in expert order: each threadgroup finds the pair at its sorted position,
 and the grid covers all pairs of one output tile before the next. Pairs that
 share an expert then run back to back and read the expert tile from cache.
-Per pair, the arithmetic is MLX's ``qmv_fast`` (K a multiple of 512) or
-``qmv`` traversal, transcribed from MLX 0.32.2 ``quantized.h``, so each
-output equals the ``gather_qmm`` output bit for bit.
+Per pair, the arithmetic is MLX's ``qmv_fast`` or ``qmv`` traversal (chosen by
+``qmv_fast_layout``, MLX's rule), transcribed from MLX 0.32.4 ``quantized.h``,
+so each output equals the ``gather_qmm`` output bit for bit.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ inline float load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
   if (BITS == 4) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -56,8 +56,8 @@ inline float load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (BITS == 5) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -69,7 +69,7 @@ inline float load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (BITS == 6) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -89,7 +89,7 @@ inline float load_vector_safe(const device T* x, thread float* x_thread, int N) 
   float sum = 0;
   if (BITS == 4) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -97,8 +97,8 @@ inline float load_vector_safe(const device T* x, thread float* x_thread, int N) 
     }
   } else if (BITS == 5) {
     for (int i = 0; i < N; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -110,7 +110,7 @@ inline float load_vector_safe(const device T* x, thread float* x_thread, int N) 
     }
   } else if (BITS == 6) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -186,6 +186,17 @@ inline float qdot_n(
   return scale * accum + sum * bias;
 }
 """
+
+
+def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> bool:
+    """MLX 0.32.4's one-row affine dispatch: K must align to the kernel block
+    (512 for 4/5-bit, 256 for 6/8-bit). Only gathered QMV still requires N
+    to be a multiple of 8; ordinary QMV supports partial output tiles."""
+    pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
+    return (not gathered or n % 8 == 0) and k % (
+        pack_factor * (1 if bits == 2 else 2) * 32
+    ) == 0
+
 
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
@@ -304,7 +315,7 @@ def supported(linear, dtype) -> bool:
     n = int(weight.shape[-2])
     k = int(scales.shape[-1]) * group_size
     values_per_thread = (8 if bits == 5 else (4 if bits == 6 else 32 // bits)) * (
-        2 if k % 512 == 0 else 1
+        2 if qmv_fast_layout(k, n, bits, gathered=True) else 1
     )
     return (
         weight.ndim == 3
@@ -353,7 +364,8 @@ def gather_qmv(linear, x: mx.array, rhs: mx.array, pairs_per_row: int) -> mx.arr
     k = int(x.shape[-1])
     n = int(weight.shape[-2])
     pairs = int(rhs.shape[0])
-    kernel = _kernel(int(linear.bits), int(linear.group_size), k % 512 == 0)
+    fast = qmv_fast_layout(k, n, int(linear.bits), gathered=True)
+    kernel = _kernel(int(linear.bits), int(linear.group_size), fast)
     return kernel(
         inputs=[x, weight, scales, biases, rhs],
         template=[

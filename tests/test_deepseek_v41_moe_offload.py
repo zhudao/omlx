@@ -377,7 +377,7 @@ def test_original_affine_expert_reads_repack_only_selected_experts(tmp_path):
         plan.close()
 
 
-def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
+def test_engram_and_expert_estimates_compose(tmp_path):
     from test_engine_pool import _make_pool
 
     from omlx.engine_pool import EngineEntry
@@ -423,8 +423,6 @@ def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
         )
         == expected
     )
-    monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-    assert pool._entry_runtime_resident_size(entry, settings) == base.mmap_bytes
 
 
 def _synthetic_affine_experts(tmp_path, fraction, seed=412):
@@ -575,11 +573,35 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         # chunk, never a chunk cut inside an expert's run.
         assert calls == [4, 3, 5, 3]
         assert disk.slots.misses == 8 and disk.slots.hits == 0
+        # Read-ahead must not outlive the call that started it.
+        assert disk.slots._ahead == {}
         # A second sweep evicts the last resident pair before reaching it:
         # sorted routes over more experts than slots thrash by construction.
         disk(x, idx, weights, sorted_indices=True)
         assert disk.slots.misses == 16 and disk.slots.hits == 0
     finally:
+        plan.close()
+
+
+def test_read_ahead_folds_into_the_inflight_window(tmp_path, monkeypatch):
+    """Carried reads count against the same bound ``ensure_ids`` enforces."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    window = 2
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", window * plan.expert_bytes)
+    try:
+        assert disk.slots.read_ahead([0, 1, 2, 3, 4, 5, 6, 7]) == window
+        assert len(disk.slots._ahead) == window
+        # The read-ahead itself installs nothing.
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+        # The chunk that needs them consumes the carried reads instead of
+        # starting a second set.
+        assert len(disk.slots.ensure_ids([0, 1])) == 2
+        assert disk.slots.misses == 2
+        assert disk.slots._ahead == {}
+    finally:
+        disk.slots.release_read_ahead()
         plan.close()
 
 
