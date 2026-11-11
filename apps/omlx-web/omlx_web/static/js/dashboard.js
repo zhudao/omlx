@@ -1728,6 +1728,25 @@
                 }
             },
 
+            async abortRequest(modelId, requestId) {
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/requests/${encodeURIComponent(requestId)}/abort`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else if (!response.ok && response.status !== 404) {
+                        // 404 means the request finished before the click landed.
+                        const data = await response.json();
+                        alert(data.detail || window.t('js.error.stop_request_failed'));
+                    }
+                } catch (err) {
+                    console.error('Failed to stop request:', err);
+                    alert(window.t('js.error.stop_request_failed'));
+                }
+            },
+
             // ===== Profiles / Templates =====
             formValuesForProfile() {
                 const ms = this.modelSettings;
@@ -3370,9 +3389,8 @@
 
             isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
-                // matches: only those validated families have routed-expert A8.
-                return type === 'qwen4_exp' || type === 'deepseek_v41'
+                // Exact matches: only these validated families have routed-expert A8.
+                return ['qwen4_exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl'].includes(type)
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
