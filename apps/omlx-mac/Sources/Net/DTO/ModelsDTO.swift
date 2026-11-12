@@ -416,6 +416,8 @@ struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
     var secondsLeft: Int? = nil
     var onBattery: Bool? = nil
     var lastPrompt: LastPrompt? = nil
+    /// ready/working: a prompt went past the helper's GPU memory and ran here.
+    var outOfMemory: Bool? = nil
     /// needs_files only: make_room or low_space, the disk left after copying
     /// and the older copies make_room deletes first.
     var prompt: String? = nil
@@ -435,7 +437,7 @@ struct PrefillHelperCandidatesDTO: Codable, Equatable, Sendable {
         let nodeId: String
         let name: String
         var chip: String? = nil
-        var ramGb: Int? = nil
+        var ramGb: Double? = nil
         let online: Bool
         var reason: String? = nil
         var link: String? = nil
