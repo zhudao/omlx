@@ -29,7 +29,7 @@ Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` t
 
 The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
 
-The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory.
 
 # macOS readability theme tests
 
@@ -135,9 +135,15 @@ Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `om
 
 # Cluster join recovery tests
 
-Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py apps/omlx-web/tests/ui/test_cluster_v2_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.
+Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py apps/omlx-web/tests/ui/test_cluster_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.
 
 For a two-Mac smoke test, start isolated servers with separate base paths. Request a join, restart only the joining server, then cancel and retry; the coordinator must remove the original pending request. Repeat with the coordinator offline: cancellation must return `state: idle` with `cleanup_pending: true`, and joining a different reachable Mac must work. Restore the coordinator and poll the join endpoint to verify cleanup. Keep existing approval/cancel race and token-ownership tests in the run; never relax the coordinator's token check to make a stale request disappear.
+
+# Hy4 offline tests
+
+Run `python -m pytest -q tests/test_hy_v4.py` for Hy4 and Hy4-flash. Tiny random models with no checkpoint download check incremental decode against the full forward, left-padded batch rows against single runs, the FP8 sanitize path, the tool parser and the thinking switches. DFly2 cases roll every cache back to the accepted prefix, reproduce greedy decoding with MTP on, and draft for two concurrent requests. Exact verify cases compare each verify row bit for bit with one-row decode, for plain and one-row batch caches and after a partial accept. Calibration cases check that the oQ layer walk and the streamed walk match the native forward. The vision cases compare the tower, the projector and the image processor with recorded transformers outputs, and follow image placeholders through M-RoPE positions, chunked prefill, decode and the DFly2 anchor. The NAX case runs only on an M5 GPU and compares the NAX sparse MLA, indexer and attention paths with their references.
+
+`tests/test_oqh.py::test_hy_v4_experts_round_trip` checks oQh exports of both models against their dequantized twins.
 
 # DeepSeek V4.1 offline tests
 
