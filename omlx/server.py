@@ -251,6 +251,8 @@ from .model_settings import (
     specprefill_draft,
 )
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.grammar import compile_answer_grammar
 from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
 from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
@@ -3325,6 +3327,15 @@ async def _with_json_keepalive(
                 )
             )
             return
+        except Exception as e:
+            handler = next(
+                app.exception_handlers[cls]
+                for cls in type(e).__mro__
+                if cls in app.exception_handlers
+            )
+            response = await handler(http_request, e)
+            yield response.body.decode()
+            return
         if result is not None:
             yield result
     finally:
@@ -3823,9 +3834,7 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model=None)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
-    """List all available models with load status."""
+async def _list_visible_models() -> list[ModelInfo]:
     models = []
     favorite_ids: set[str] = set()
 
@@ -3984,6 +3993,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
 
+    return models
+
+
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
+    """List all available models with load status."""
+    models = await _list_visible_models()
+
     # Serialize explicitly: FastAPI's jsonable_encoder and the
     # ``ModelsResponse`` container both serialize items as the base
     # ``ModelInfo`` (dropping the tier metadata), while a route-level
@@ -4048,6 +4065,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id:path}", response_model=None)
+async def retrieve_model(
+    model_id: str, _: bool = Depends(verify_inference_api_key)
+) -> JSONResponse:
+    """Return one visible model, matching an OpenAI retrieve call."""
+    for model in await _list_visible_models():
+        if model.id == model_id:
+            return JSONResponse(content=model.model_dump())
+    raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -5856,6 +5884,8 @@ def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | Non
     # channel headers that a bare grammar would mask.
     if reasoning_parser is None and engine.model_type == "gpt_oss":
         return "harmony"
+    if reasoning_parser is None and engine.model_type in INKLING2_MODEL_TYPES:
+        return "inkling2"
     return reasoning_parser
 
 
@@ -5874,6 +5904,10 @@ def _compile_with_structural_tag(
     import xgrammar as xgr
 
     ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "inkling2":
+        return compile_answer_grammar(
+            compiler, fmt, ct_kwargs, max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT
+        )
     if reasoning_parser == "minimax_m3":
         reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
     else:

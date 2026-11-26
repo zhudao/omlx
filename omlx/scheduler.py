@@ -75,9 +75,6 @@ from .patches.inkling2.kernels import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
-from .patches.mlx_lm_mtp.batch_generator import (
-    _spec_command_buffers as _decode_command_buffers,
-)
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import (
     allow_early_kv_growth,
@@ -923,10 +920,6 @@ def _omlx_advance_grammar_rows(self) -> None:
 
 _original_generation_batch_step = GenerationBatch._step
 
-# Decode of small-active MoE models is bound by command-buffer commits. Dense
-# decode keeps MLX's caps because larger buffers slow it on M5.
-_DECODE_CAPS_TYPES = frozenset({"qwen3_5_moe", "qwen3_6_moe"})
-
 
 def _patched_generation_batch_step(self):
     # Build per-batch mRoPE deltas from UID mapping before each step.
@@ -949,9 +942,6 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
-    if getattr(model, "model_type", None) in _DECODE_CAPS_TYPES:
-        with _decode_command_buffers(model):
-            return _original_generation_batch_step(self)
     return _original_generation_batch_step(self)
 
 
@@ -11394,6 +11384,12 @@ class Scheduler:
                         block_table,
                         promote_to_hot_cache=not bypass_hot_cache,
                     )
+                    if reconstructed is None and self._gdn_split_active():
+                        retry = self._restore_shared_system_prefix(
+                            request, original_tokens, bypass_hot_cache
+                        )
+                        if retry is not None:
+                            block_table, reconstructed = retry
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
                     reconstructed = None
@@ -11557,6 +11553,41 @@ class Scheduler:
                 0, request.cached_tokens - request.requeue_reported_cached_tokens
             )
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _restore_shared_system_prefix(
+        self,
+        request: Request,
+        matched_tokens: int,
+        bypass_hot_cache: bool,
+    ) -> tuple[Any, list[Any]] | None:
+        system_end = request.system_prefix_end
+        if not 0 < system_end < matched_tokens:
+            return None
+        self.paged_cache_manager.delete_block_table(request.request_id)
+        block_table, _ = self.block_aware_cache.fetch_cache(
+            request.request_id,
+            request.prompt_token_ids[:system_end],
+            extra_keys=request.vlm_extra_keys_for_cache,
+            extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+            extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            record_stats=False,
+        )
+        if block_table is None:
+            return None
+        reconstructed = self.block_aware_cache.reconstruct_cache(
+            block_table,
+            promote_to_hot_cache=not bypass_hot_cache,
+        )
+        if reconstructed is None:
+            return None
+        logger.info(
+            "Split GDN restore for %s: no recurrent checkpoint on the %d-token "
+            "match; restored the shared system prefix (%d tokens) instead",
+            request.request_id,
+            matched_tokens,
+            block_table.num_tokens,
+        )
+        return block_table, reconstructed
 
     def _record_prefix_cache_result(self, request: Request) -> None:
         """Finalize ordinary prefix metrics after scheduling's fallback guards."""

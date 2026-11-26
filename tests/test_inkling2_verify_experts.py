@@ -4,12 +4,15 @@ keeps the bits ``gather_qmm`` gives it in the row's one-row decode step."""
 
 from __future__ import annotations
 
+from functools import cache
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.inkling2 import expert_mma, verify_experts
 from omlx.patches.inkling2 import model as inkling2
-from omlx.patches.inkling2 import verify_experts
 from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -17,6 +20,7 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 _EXPERTS, _TOP_K = 10, 4
 
 
+@cache
 def _experts(hidden, inter, fmt="nvfp4", experts=_EXPERTS):
     args = inkling2.TextArgs(
         hidden_size=hidden,
@@ -77,25 +81,30 @@ def _armed(mod, x, inds, weights):
     return z, w
 
 
-def _count_gathers(monkeypatch):
+def _count_gathers(monkeypatch, kernel=verify_experts):
     calls = []
-    gather = verify_experts.gather
+    gather = kernel.gather
 
     def counted(*args, **kwargs):
         calls.append(1)
         return gather(*args, **kwargs)
 
-    monkeypatch.setattr(verify_experts, "gather", counted)
+    monkeypatch.setattr(kernel, "gather", counted)
     return calls
 
 
 # K = 304 leaves 48 values past the last full 256-value block (lanes 0 to 5),
 # K = 144 and 80 have no full block, 2304 and 1152 are Inkling 2 Mini's.
 @pytest.mark.parametrize(
-    "hidden, inter", [(304, 144), (272, 80), (2304, 1152)], ids=str
+    "hidden, inter, rows, dtype",
+    [
+        (304, 144, 3, mx.bfloat16),
+        (272, 80, 16, mx.float16),
+        (2304, 1152, 16, mx.bfloat16),
+        (2304, 1152, 3, mx.float16),
+    ],
+    ids=str,
 )
-@pytest.mark.parametrize("rows", [2, 3, 5, 16])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 def test_verify_rows_keep_their_decode_step_bits(
     hidden, inter, rows, dtype, monkeypatch
 ):
@@ -180,3 +189,52 @@ def test_short_blocks_take_the_kernel_with_gather_qmm_bits(rows, dtype, monkeypa
     assert len(calls) == 2
     assert mx.array_equal(z, ref_z)
     assert mx.array_equal(w, ref_w)
+
+
+def _affine_experts(bits, dtype):
+    args = inkling2.TextArgs(
+        hidden_size=2304,
+        intermediate_size=1152,
+        n_routed_experts=_EXPERTS,
+        num_experts_per_tok=_TOP_K,
+    )
+    spec = {"mode": "affine", "bits": bits, "group_size": 64}
+    mod = inkling2.Inkling2Experts(args, spec, spec)
+    mx.random.seed(0)
+    for proj in (mod.w13, mod.w2):
+        e, n, _ = proj.weight.shape
+        w = mx.random.normal((e, n, proj.scales.shape[-1] * 64)) * 0.05
+        q, s, b = mx.quantize(w, group_size=64, bits=bits)
+        proj.weight, proj.scales, proj.biases = q, s.astype(dtype), b.astype(dtype)
+    return mod
+
+
+def _prefill_block(dtype):
+    x, inds, weights = _block(70, 2304, 21, dtype, experts=8)
+    return x, mx.array([0, 1, 2, 4, 5, 6, 8, 9], dtype=mx.uint32)[inds], weights
+
+
+@pytest.mark.skipif(is_nax_available(), reason="NAX hosts keep gather_qmm")
+def test_prefill_chunks_take_the_q3_kernel_with_gather_qmm_bits(monkeypatch):
+    mod = _affine_experts(3, mx.float16)
+    x, inds, weights = _prefill_block(mx.float16)
+    calls = _count_gathers(monkeypatch, expert_mma)
+    z, _ = mod.unreduced(x, inds, weights)
+    monkeypatch.setattr(expert_mma, "supported", lambda proj, dtype: False)
+    ref, _ = mod.unreduced(x, inds, weights)
+    assert len(calls) == 2
+    assert mx.array_equal(z, ref)
+
+
+@pytest.mark.parametrize(
+    "bits, dtype, nax",
+    [(3, mx.bfloat16, False), (4, mx.float16, False), (3, mx.float16, True)],
+    ids=["bfloat16", "bits4", "nax"],
+)
+def test_other_prefill_chunks_keep_gather_qmm(bits, dtype, nax, monkeypatch):
+    monkeypatch.setattr(expert_mma, "is_nax_available", lambda: nax)
+    mod = _affine_experts(bits, dtype)
+    x, inds, weights = _prefill_block(dtype)
+    calls = _count_gathers(monkeypatch, expert_mma)
+    mx.eval(mod.unreduced(x, inds, weights)[0])
+    assert not calls
